@@ -39,6 +39,25 @@ def load_config(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def configure_repository(config: dict[str, Any]) -> None:
+    """Use the workflow's repository for generated links when running in Actions.
+
+    The checked-in config keeps the upstream project as the local default, but
+    a fork's release workflow must read that fork's releases and publish feed
+    URLs from that fork's main branch.
+    """
+    repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repository:
+        return
+    if not re.fullmatch(r"[^/]+/[^/]+", repository):
+        raise ValueError(f"invalid GITHUB_REPOSITORY value: {repository!r}")
+
+    config["repo"] = repository
+    config["distribution"]["sourceBaseURL"] = (
+        f"https://raw.githubusercontent.com/{repository}/main"
+    )
+
+
 def fetch_releases(repo: str) -> list[dict[str, Any]]:
     api_url = f"https://api.github.com/repos/{repo}/releases"
     headers = {
@@ -411,6 +430,7 @@ def main() -> int:
     root = Path(__file__).resolve().parent.parent
     config_path = root / "distribution" / "config.json"
     config = load_config(config_path)
+    configure_repository(config)
     validate_config(config)
 
     try:
