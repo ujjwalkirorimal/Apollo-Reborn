@@ -73,6 +73,9 @@ static NSString *const UDKeyGoogleSearchTimeRange = @"GoogleSearchTimeRange";
 static NSString *const UDKeyGoogleSearchExactWords = @"GoogleSearchExactWords";
 static NSString *const UDKeyRandomSubredditsSource = @"RandomSubredditsSource";
 static NSString *const UDKeyRandNsfwSubredditsSource = @"RandNsfwSubredditsSource";
+// When enabled, Random / RandNSFW discover a community from Reddit's
+// /subreddits/search endpoint instead of using the configured text sources.
+static NSString *const UDKeyBoostRandomSubredditDiscovery = @"BoostRandomSubredditDiscovery";
 // When enabled, the Search tab's as-you-type subreddit suggestions show each
 // community's member count (Boost-style), fed by the shared subreddit info cache.
 static NSString *const UDKeySearchSuggestionMemberCounts = @"SearchSuggestionMemberCounts";

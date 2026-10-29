@@ -3250,6 +3250,16 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   onToggle:^(UISwitch *sender) { [weakSelf randNsfwSwitchToggled:sender]; }];
     [searchRows addObject:randNSFW];
 
+    ApolloSettingsRow *boostRandomDiscovery =
+        [ApolloSettingsRow switchRowWithID:@"sub.boostRandomDiscovery"
+                                     title:@"Use Boost-style Random Discovery"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBoostRandomSubredditDiscovery]; }
+                                  onToggle:^(UISwitch *sender) {
+                                      [[NSUserDefaults standardUserDefaults] setBool:sender.on
+                                                                            forKey:UDKeyBoostRandomSubredditDiscovery];
+                                  }];
+    [searchRows addObject:boostRandomDiscovery];
+
     ApolloSettingsRow *suggestionMemberCounts =
         [ApolloSettingsRow switchRowWithID:@"sub.suggestionMemberCounts"
                                      title:@"Show Member Counts in Suggestions"
@@ -3280,7 +3290,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                          footer:@"Recently Visited clears on restart or account change."
                                            rows:@[ trendingLimit, recentlyVisitedLimit ]],
         [ApolloSettingsSection sectionWithTitle:@"Subreddit Sources"
-                                         footer:nil
+                                         footer:@"Boost-style discovery searches Reddit for a random eligible community instead of using the Random and RandNSFW text sources."
                                            rows:@[ trendingSource, randomSource, randNSFWSource ]],
     ];
 }

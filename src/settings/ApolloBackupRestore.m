@@ -648,7 +648,7 @@ static BOOL ApolloBackupValidMainPreferences(NSDictionary *preferences) {
         UDKeyImageChestAPIToken, UDKeyImgurClientId, UDKeyLibreTranslateAPIKey,
         UDKeyLibreTranslateURL, UDKeyLinkPreviewCardColorHex, UDKeyOpenRouterAIModel,
         UDKeyOpenRouterAPIKey, UDKeyRandNsfwSubredditsSource, UDKeyRandomSubredditsSource,
-        UDKeySearchSuggestionMemberCounts,
+        UDKeyBoostRandomSubredditDiscovery, UDKeySearchSuggestionMemberCounts,
         UDKeyRedditClientId, UDKeyRedditClientSecret, UDKeyRedirectURI,
         UDKeyTranslationProvider, UDKeyTranslationTargetLanguage, UDKeyTrendingSubredditsLimit,
         UDKeyTrendingSubredditsSource, UDKeyUserAgent,

@@ -14,6 +14,9 @@ void ApolloRedditCaptureBearerTokenFromRequest(NSURLRequest *request, NSString *
 // callers that need to make their own authenticated oauth.reddit.com requests
 // (e.g. ApolloHiddenContentData).
 NSString *ApolloLatestRedditBearerToken(void);
+// The bearer suitable for tweak-authored Reddit reads on the active account.
+// Returns nil for API-Key-Free sessions so callers use the web-session path.
+NSString *ApolloActiveAccountRedditBearerToken(void);
 
 // Request rewriting. Returns nil if the request should be passed through unchanged.
 NSURLRequest *ApolloRedditMaybeRewriteSubmitRequest(NSURLRequest *request);

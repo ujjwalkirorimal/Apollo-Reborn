@@ -1989,6 +1989,163 @@ void ApolloPrepareRandomNSFWSubredditSource(
             });
         });
 }
+
+// Reddit retired /r/random and /r/randnsfw. Boost now emulates them by using
+// the community-search endpoint with a randomly selected, common two-letter
+// prefix. Keep this independent of the text-source path above: source mode is
+// still the default and this routine only runs when the user opts in.
+static NSArray<NSString *> *ApolloBoostRandomSearchPrefixes(void) {
+    static NSArray<NSString *> *prefixes;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        prefixes = @[
+            @"ab", @"ac", @"ad", @"al", @"am", @"an", @"ar", @"as", @"at",
+            @"ba", @"be", @"bi", @"bo", @"br", @"bu", @"ca", @"ch", @"co",
+            @"cr", @"de", @"di", @"do", @"dr", @"ea", @"el", @"en", @"es",
+            @"fa", @"fi", @"fo", @"fr", @"ga", @"ge", @"go", @"gr", @"ha",
+            @"he", @"hi", @"ho", @"in", @"ka", @"ki", @"la", @"le", @"li",
+            @"lo", @"ma", @"me", @"mi", @"mo", @"mu", @"na", @"ne", @"no",
+            @"op", @"or", @"pa", @"pe", @"ph", @"pi", @"pl", @"po", @"pr",
+            @"ra", @"re", @"ri", @"ro", @"sa", @"sc", @"se", @"sh", @"sk",
+            @"so", @"sp", @"st", @"su", @"ta", @"te", @"th", @"ti", @"to",
+            @"tr", @"un", @"va", @"vi", @"wa", @"wi", @"wo", @"ya", @"zo"
+        ];
+    });
+    return prefixes;
+}
+
+static NSError *ApolloBoostRandomError(NSString *description) {
+    return [NSError errorWithDomain:@"com.apolloreborn.boost-random"
+                               code:NSURLErrorBadServerResponse
+                           userInfo:@{ NSLocalizedDescriptionKey:
+                                           description ?: @"Couldn't find a random subreddit." }];
+}
+
+static NSArray<NSString *> *ApolloBoostRandomCandidates(
+    NSData *data,
+    BOOL includeNSFW
+) {
+    if (data.length == 0) return @[];
+    NSError *jsonError = nil;
+    id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+    if (jsonError || ![root isKindOfClass:[NSDictionary class]]) return @[];
+    id listing = ((NSDictionary *)root)[@"data"];
+    if (![listing isKindOfClass:[NSDictionary class]]) return @[];
+    id children = ((NSDictionary *)listing)[@"children"];
+    if (![children isKindOfClass:[NSArray class]]) return @[];
+
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    for (id child in (NSArray *)children) {
+        NSDictionary *community = [child isKindOfClass:[NSDictionary class]] ? child[@"data"] : nil;
+        if (![community isKindOfClass:[NSDictionary class]]) continue;
+        NSString *name = community[@"display_name"];
+        NSString *type = [community[@"subreddit_type"] isKindOfClass:[NSString class]]
+            ? [community[@"subreddit_type"] uppercaseString] : @"";
+        id over18 = community[@"over18"];
+        id over18Compat = community[@"over_18"];
+        BOOL nsfw = ([over18 respondsToSelector:@selector(boolValue)] && [over18 boolValue]) ||
+                    ([over18Compat respondsToSelector:@selector(boolValue)] && [over18Compat boolValue]);
+        id subscriberCount = community[@"subscribers"];
+        NSInteger subscribers = [subscriberCount respondsToSelector:@selector(integerValue)]
+            ? [subscriberCount integerValue] : 0;
+        if (!ApolloSubredditSourceLineIsValid(name) || nsfw != includeNSFW ||
+            subscribers < 1000 || [type isEqualToString:@"PRIVATE"]) continue;
+        [candidates addObject:name];
+    }
+    return candidates;
+}
+
+static void ApolloBoostRandomAttempt(
+    BOOL includeNSFW,
+    NSUInteger attemptNumber,
+    NSMutableSet<NSString *> *usedPrefixes,
+    void (^attemptHandler)(NSUInteger attemptNumber),
+    void (^completion)(NSString *subreddit, NSError *error)
+) {
+    if (attemptNumber >= 4) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(nil, ApolloBoostRandomError(
+                @"Reddit did not return an eligible community. Try again."));
+        });
+        return;
+    }
+
+    NSArray<NSString *> *prefixes = ApolloBoostRandomSearchPrefixes();
+    NSMutableArray<NSString *> *availablePrefixes =
+        [NSMutableArray arrayWithCapacity:prefixes.count];
+    // Empty result pages trigger another search. Avoid paying for the same
+    // query twice when a later attempt could sample a different part of the
+    // subreddit catalog.
+    for (NSString *candidate in prefixes) {
+        if (![usedPrefixes containsObject:candidate]) [availablePrefixes addObject:candidate];
+    }
+    if (availablePrefixes.count == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(nil, ApolloBoostRandomError(
+                @"Reddit did not return an eligible community. Try again."));
+        });
+        return;
+    }
+    NSString *prefix = availablePrefixes[arc4random_uniform((uint32_t)availablePrefixes.count)];
+    [usedPrefixes addObject:prefix];
+    ApolloLog(@"[BoostRandom] Attempt %lu (of 4) searching prefix '%@' (%@)",
+              (unsigned long)attemptNumber + 1, prefix,
+              includeNSFW ? @"NSFW" : @"SFW");
+    if (attemptHandler) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            attemptHandler(attemptNumber);
+        });
+    }
+    NSURLComponents *components = [NSURLComponents componentsWithString:@"https://oauth.reddit.com/subreddits/search.json"];
+    components.queryItems = @[
+        [NSURLQueryItem queryItemWithName:@"q" value:prefix],
+        [NSURLQueryItem queryItemWithName:@"sort" value:@"relevance"],
+        [NSURLQueryItem queryItemWithName:@"include_over_18" value:includeNSFW ? @"on" : @"off"],
+        [NSURLQueryItem queryItemWithName:@"limit" value:@"100"],
+        [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"],
+    ];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:components.URL];
+    request.timeoutInterval = 10.0;
+    [request setValue:sUserAgent.length > 0 ? sUserAgent : @"ApolloReborn/1.0"
+   forHTTPHeaderField:@"User-Agent"];
+    NSString *bearer = ApolloActiveAccountRedditBearerToken();
+    if (bearer.length > 0) {
+        [request setValue:[@"bearer " stringByAppendingString:bearer]
+       forHTTPHeaderField:@"Authorization"];
+    }
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+        dataTaskWithRequest:request
+          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]]
+            ? (NSHTTPURLResponse *)response : nil;
+        NSArray<NSString *> *candidates = !error && http.statusCode >= 200 && http.statusCode < 300
+            ? ApolloBoostRandomCandidates(data, includeNSFW) : @[];
+        if (candidates.count > 0) {
+            NSString *subreddit = candidates[arc4random_uniform((uint32_t)candidates.count)];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(subreddit, nil);
+            });
+        } else if (error || http.statusCode < 200 || http.statusCode >= 300) {
+            NSString *message = error.localizedDescription ?: [NSString stringWithFormat:@"Reddit returned HTTP %ld.", (long)http.statusCode];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(nil, ApolloBoostRandomError(message));
+            });
+        } else {
+            ApolloBoostRandomAttempt(includeNSFW, attemptNumber + 1, usedPrefixes,
+                                     attemptHandler, completion);
+        }
+    }];
+    [task resume];
+}
+
+void ApolloResolveBoostRandomSubreddit(
+    BOOL includeNSFW,
+    void (^attemptHandler)(NSUInteger attemptNumber),
+    void (^completion)(NSString *subreddit, NSError *error)
+) {
+    ApolloBoostRandomAttempt(includeNSFW, 0, [NSMutableSet set], attemptHandler, completion);
+}
 // Replace Reddit API client ID. Resolved per credential (see
 // ApolloAccountCredentials.{h,m}): a credential created by an interactive
 // sign-in (Add Account) keeps the default key it started with, every other one
@@ -3656,6 +3813,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyRecentlyVisitedSubredditsLimit: @"5",
                                     UDKeySearchTabSectionOrder: @[@"trending", @"random", @"recent"],
                                     UDKeyShowRandNsfw: @NO,
+                                    UDKeyBoostRandomSubredditDiscovery: @NO,
                                     UDKeySearchSuggestionMemberCounts: @YES,
                                     UDKeyRandomSubredditsSource: defaultRandomSubredditsSource,
                                     UDKeyRandNsfwSubredditsSource: @"",

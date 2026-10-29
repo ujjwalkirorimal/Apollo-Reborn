@@ -9,6 +9,15 @@ FOUNDATION_EXPORT void ApolloRefreshTrendingSubreddits(
     ApolloTrendingSubredditsRefreshCompletion completion);
 FOUNDATION_EXPORT void ApolloPrepareRandomNSFWSubredditSource(
     ApolloSubredditSourcePreparationCompletion completion);
+// Mirrors Boost's replacement for Reddit's retired random endpoints: search a
+// randomly chosen two-letter prefix, filter the returned communities, then
+// choose one candidate. `attemptHandler` fires on the main queue each time a
+// prefix search starts (0-based, at most 4 attempts) so callers can surface
+// progress; it may be NULL. Completion is always delivered on the main queue.
+FOUNDATION_EXPORT void ApolloResolveBoostRandomSubreddit(
+    BOOL includeNSFW,
+    void (^attemptHandler)(NSUInteger attemptNumber),
+    void (^completion)(NSString *subreddit, NSError *error));
 __END_DECLS
 
 @interface ShareUrlTask : NSObject

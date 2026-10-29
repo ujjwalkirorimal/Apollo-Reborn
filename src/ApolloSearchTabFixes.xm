@@ -52,6 +52,13 @@
 // replaces that Swift value through ApolloSwiftIvarBridge, then reloads the native section.
 // Random NSFW extends section 3 to two rows and still routes through the tweak's custom
 // /r/randnsfw request rewrite; Reddit's original endpoint no longer exists.
+//
+// With Boost-style random discovery enabled, both section-3 rows push
+// ApolloRandomSubredditLoadingViewController the instant they're tapped — the
+// multi-attempt community search can take seconds, and a silently deselected
+// row reads as a dead button. The placeholder shows a spinner with per-attempt
+// progress, swaps itself out for Apollo's own subreddit screen on success, and
+// offers an inline Try Again on failure.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -60,6 +67,8 @@
 
 #import "ApolloCommon.h"
 #import "ApolloDuoSplitView.h"
+#import "ApolloRandomSubredditLoadingViewController.h"
+#import "ApolloRandomShuffleButton.h"
 #import "ApolloSearchLandingViewController.h"
 #import "ApolloSearchRecents.h"
 #import "ApolloSearchLandingPreferences.h"
@@ -118,6 +127,7 @@ static const void *kApolloSearchRefreshInFlightKey = &kApolloSearchRefreshInFlig
 static const void *kApolloSearchRandomNSFWActiveKey = &kApolloSearchRandomNSFWActiveKey;
 static const void *kApolloSearchRandomNSFWSuppressedKey = &kApolloSearchRandomNSFWSuppressedKey;
 static const void *kApolloSearchRandomNSFWInFlightKey = &kApolloSearchRandomNSFWInFlightKey;
+static const void *kApolloSearchBoostRandomInFlightKey = &kApolloSearchBoostRandomInFlightKey;
 static NSString *const kApolloRandomNSFWTitle = @"Random NSFW Subreddit";
 
 // The controller's grouped UITableView. SearchViewController subclasses
@@ -196,6 +206,55 @@ static BOOL ApolloSearchTabAssignTrendingSubreddits(UIViewController *vc, NSArra
 
 static BOOL ApolloSearchTabRandomNSFWEnabled(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRandNsfw];
+}
+
+static BOOL ApolloSearchTabBoostRandomDiscoveryEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBoostRandomSubredditDiscovery];
+}
+
+static BOOL ApolloSearchTabIsRandomIndexPath(NSIndexPath *indexPath) {
+    // Apollo's native Random Subreddit cell is the first row in section 3.
+    // The optional NSFW action is injected directly after it.
+    return indexPath.section == 3 && indexPath.row == 0;
+}
+
+static void ApolloSearchTabOpenBoostRandomSubreddit(
+    UIViewController *controller,
+    UITableView *tableView,
+    NSIndexPath *indexPath,
+    BOOL includeNSFW
+) {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if ([objc_getAssociatedObject(controller, kApolloSearchBoostRandomInFlightKey) boolValue]) return;
+
+    UINavigationController *nav = controller.navigationController;
+    if (!nav) {
+        ApolloLogError(@"[BoostRandom] Search tab has no navigation controller; can't show placeholder");
+        ApolloShowToastWithStyle(@"Couldn't Open Random Subreddit",
+                                 @"Apollo's navigation stack was unavailable.",
+                                 ApolloToastStyleError, nil);
+        return;
+    }
+
+    // Push the Boost-style placeholder immediately so the tap has a visible
+    // effect instead of a silent multi-attempt search: the screen shows a
+    // spinner (with per-attempt progress) while the community-search
+    // emulation resolves, then swaps itself out for Apollo's own subreddit
+    // screen once a community is picked. Failures surface inline there with
+    // a Try Again button. The placeholder owns the resolution lifecycle; the
+    // in-flight guard here only covers the push animation window.
+    objc_setAssociatedObject(controller, kApolloSearchBoostRandomInFlightKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloRandomSubredditLoadingViewController *placeholder =
+        [[ApolloRandomSubredditLoadingViewController alloc]
+            initWithTitle:includeNSFW ? kApolloRandomNSFWTitle : @"Random Subreddit"
+              includeNSFW:includeNSFW];
+    __weak UIViewController *weakController = controller;
+    placeholder.onFinished = ^{
+        objc_setAssociatedObject(weakController, kApolloSearchBoostRandomInFlightKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    };
+    [nav pushViewController:placeholder animated:YES];
 }
 
 static BOOL ApolloSearchTabRandomNSFWActive(UIViewController *vc) {
@@ -751,7 +810,18 @@ static void ApolloSearchTabScheduleLandingUpdate(UIViewController *vc) {
 
 - (void)tableView:(UITableView *)tableView
  didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloSearchTabBoostRandomDiscoveryEnabled() &&
+        (ApolloSearchTabIsRandomIndexPath(indexPath) ||
+         ApolloSearchTabIsRandomNSFWIndexPath(self, indexPath))) {
+        ApolloSearchTabOpenBoostRandomSubreddit(
+            self, tableView, indexPath, ApolloSearchTabIsRandomNSFWIndexPath(self, indexPath));
+        return;
+    }
     if (!ApolloSearchTabIsRandomNSFWIndexPath(self, indexPath)) {
+        if (ApolloSearchTabIsRandomIndexPath(indexPath)) {
+            ApolloRandomShufflePrepareLegacyRoute(
+                self.navigationController, nil, NO, NO);
+        }
         %orig;
         return;
     }
@@ -789,7 +859,10 @@ static void ApolloSearchTabScheduleLandingUpdate(UIViewController *vc) {
         }
 
         NSURL *url = [NSURL URLWithString:@"https://reddit.com/r/randnsfw"];
+        ApolloRandomShufflePrepareLegacyRoute(
+            controller.navigationController, nil, YES, NO);
         if (!ApolloRouteResolvedURLViaApolloScheme(url)) {
+            ApolloRandomShuffleCancelLegacyRoute(controller.navigationController);
             ApolloShowToastWithStyle(
                 @"Couldn't Open Random NSFW Subreddit",
                 @"Apollo's native subreddit router was unavailable.",
@@ -797,6 +870,24 @@ static void ApolloSearchTabScheduleLandingUpdate(UIViewController *vc) {
                 nil);
         }
     });
+}
+
+%end
+
+// Apollo's legacy /r/random route resolves through its own navigation stack.
+// Observe that push so feeds opened with Boost discovery disabled still get
+// the shuffle FAB, and carry the same legacy mode into subsequent shuffles.
+%hook UINavigationController
+
+- (void)pushViewController:(UIViewController *)viewController animated:(BOOL)animated {
+    %orig;
+    ApolloRandomShuffleDidPushViewController(self, viewController);
+}
+
+- (void)setViewControllers:(NSArray<UIViewController *> *)viewControllers
+                  animated:(BOOL)animated {
+    %orig;
+    ApolloRandomShuffleDidPushViewController(self, viewControllers.lastObject);
 }
 
 %end
