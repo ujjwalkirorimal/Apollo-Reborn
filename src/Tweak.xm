@@ -21,6 +21,7 @@
 #import "ApolloNotificationBackend.h"
 #import "ApolloUsageHeartbeat.h"
 #import "ApolloUpdateChecker.h"
+#import "ApolloWebJSONRouteUpdates.h"
 #import "ApolloPushNotifications.h"
 #import "ApolloBarkNotifications.h"
 #import "ApolloLiquidGlassIconSelectionState.h"
@@ -3964,6 +3965,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyAutomaticUpdateChecks: @YES,
                                     UDKeyWebJSONEnabled: @NO,
                                     UDKeyReduceRateLimiting: @NO,
+                                    UDKeyKeylessRouteUpdates: @YES,
                                     UDKeyReduceRateLimitingOffered: @NO,
                                     UDKeyUseModernRedditChat: @NO,
                                     UDKeyUseModernRedditModmail: @NO,
@@ -4368,6 +4370,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // hooks, so reading before they're in place returns nothing.
     sWebJSONEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONEnabled];
     sReduceRateLimiting = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyReduceRateLimiting];
+    sKeylessRouteUpdates = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeylessRouteUpdates];
     sPollsFeatureEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPollsEnabled];
     sPollOptionAlignment = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPollOptionAlignment];
     if (sPollOptionAlignment != ApolloPollOptionAlignmentCenter && sPollOptionAlignment != ApolloPollOptionAlignmentLeft) {
@@ -4706,6 +4709,8 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
+        // Silent, so the Setup Assistant doesn't hold it back.
+        ApolloWebJSONRouteUpdatesCheckIfNeeded();
         if (ApolloSetupAssistantBlocksLaunchPrompts()) return;
         ApolloSendUsageHeartbeatIfNeeded();
         ApolloUpdateCheckIfNeeded();
