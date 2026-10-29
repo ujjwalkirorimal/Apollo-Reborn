@@ -3250,6 +3250,16 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   onToggle:^(UISwitch *sender) { [weakSelf randNsfwSwitchToggled:sender]; }];
     [searchRows addObject:randNSFW];
 
+    ApolloSettingsRow *suggestionMemberCounts =
+        [ApolloSettingsRow switchRowWithID:@"sub.suggestionMemberCounts"
+                                     title:@"Show Member Counts in Suggestions"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySearchSuggestionMemberCounts]; }
+                                  onToggle:^(UISwitch *sender) {
+                                      [[NSUserDefaults standardUserDefaults] setBool:sender.on
+                                                                            forKey:UDKeySearchSuggestionMemberCounts];
+                                  }];
+    [searchRows addObject:suggestionMemberCounts];
+
     ApolloSettingsRow *randNSFWSource =
         [ApolloSettingsRow customRowWithID:@"sub.randNSFWSource"
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {

@@ -348,6 +348,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSubredditSwitcherSheet.xm \
     $(SRC_DIR)/ApolloSearchHeaderOverlapFix.xm \
     $(SRC_DIR)/ApolloSearchTabFixes.xm \
+    $(SRC_DIR)/ApolloSearchMemberCounts.xm \
     $(SRC_DIR)/ApolloSearchLandingViewController.m \
     $(SRC_DIR)/ApolloSearchRecents.m \
     $(SRC_DIR)/ApolloSearchLandingPreferences.m \

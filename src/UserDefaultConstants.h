@@ -73,6 +73,9 @@ static NSString *const UDKeyGoogleSearchTimeRange = @"GoogleSearchTimeRange";
 static NSString *const UDKeyGoogleSearchExactWords = @"GoogleSearchExactWords";
 static NSString *const UDKeyRandomSubredditsSource = @"RandomSubredditsSource";
 static NSString *const UDKeyRandNsfwSubredditsSource = @"RandNsfwSubredditsSource";
+// When enabled, the Search tab's as-you-type subreddit suggestions show each
+// community's member count (Boost-style), fed by the shared subreddit info cache.
+static NSString *const UDKeySearchSuggestionMemberCounts = @"SearchSuggestionMemberCounts";
 static NSString *const UDKeyTrendingSubredditsSource = @"TrendingSubredditsSource";
 static NSString *const UDKeyTrendingSubredditsLimit = @"TrendingSubredditsLimit";
 // Search landing history display count. Default 5; empty means unlimited, 0 hides.

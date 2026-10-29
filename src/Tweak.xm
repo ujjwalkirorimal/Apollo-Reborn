@@ -3656,6 +3656,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyRecentlyVisitedSubredditsLimit: @"5",
                                     UDKeySearchTabSectionOrder: @[@"trending", @"random", @"recent"],
                                     UDKeyShowRandNsfw: @NO,
+                                    UDKeySearchSuggestionMemberCounts: @YES,
                                     UDKeyRandomSubredditsSource: defaultRandomSubredditsSource,
                                     UDKeyRandNsfwSubredditsSource: @"",
                                     UDKeyTrendingSubredditsSource: defaultTrendingSubredditsSource,
