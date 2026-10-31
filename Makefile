@@ -63,6 +63,10 @@ KSCRASH_FILES := \
 
 # ApolloFavoriteConfirm.xm must stay after ApolloSubredditIndexPolish.xm and
 # ApolloFollowingSection.xm so its favoriteSubredditButtonTapped: hook is outermost.
+# ApolloInboxCommentScroll.xm must stay after ApolloScrollToTop.xm so its
+# scrollViewShouldScrollToTop: and tab-reselect hooks are outermost: ScrollToTop
+# returns NO without %orig when it runs its own jump, which would skip ending
+# the landing hold.
 ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloClasses.m \
     $(SRC_DIR)/ApolloFoundationModels.swift \
@@ -175,6 +179,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloGalleryOrientation.xm \
     $(SRC_DIR)/ApolloBannedProfile.xm \
     $(SRC_DIR)/ApolloImageUploadHost.xm \
+    $(SRC_DIR)/ApolloNewVideoPost.xm \
     $(SRC_DIR)/ApolloPhotoPostComposerScrollFix.xm \
     $(SRC_DIR)/ApolloMarkdownToolbarGif.xm \
     $(SRC_DIR)/ApolloComposerToolbarTint.xm \
@@ -200,7 +205,6 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloCommentsCollapse.xm \
     $(SRC_DIR)/ApolloCommentHeaderLayout.xm \
     $(SRC_DIR)/ApolloMaintainerTint.m \
-    $(SRC_DIR)/ApolloInboxCommentScroll.xm \
     $(SRC_DIR)/ApolloFindInComments.xm \
     $(SRC_DIR)/ApolloFindInCommentsGlass.xm \
     $(SRC_DIR)/ApolloStatsRowTouch.xm \
@@ -211,6 +215,9 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloLoadMoreComments.xm \
     $(SRC_DIR)/ApolloCommentSubmitFailure.xm \
     $(SRC_DIR)/ApolloLiveCommentsFollow.xm \
+    $(SRC_DIR)/ApolloCommentNavigationModel.m \
+    $(SRC_DIR)/ApolloCommentNavigator.xm \
+    $(SRC_DIR)/ApolloCommentNavigatorUI.xm \
     $(SRC_DIR)/settings/ApolloSettingsGeneralTable.xm \
     $(SRC_DIR)/settings/ApolloSettingsNativeInjections.xm \
     $(SRC_DIR)/ApolloPerPostCommentSort.xm \
@@ -241,6 +248,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ipad/ApolloPaneGeometry.m \
     $(SRC_DIR)/ipad/ApolloPaneTransitionObserver.m \
     $(SRC_DIR)/ipad/ApolloPaneChrome.m \
+    $(SRC_DIR)/ipad/ApolloPaneMessageBar.xm \
     $(SRC_DIR)/ipad/ApolloPaneSidebar.m \
     $(SRC_DIR)/ipad/ApolloPaneFocus.m \
     $(SRC_DIR)/ipad/ApolloPaneMenus.xm \
@@ -258,15 +266,17 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSettings.xm \
     $(SRC_DIR)/settings/ApolloSettingsTabMenu.xm \
     $(SRC_DIR)/settings/ApolloShortcutListEditing.xm \
+    $(SRC_DIR)/ApolloUpvotedPostsFeed.m \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloIntelligenceBridge.xm \
     $(SRC_DIR)/settings/ApolloSiriSettingsViewController.m \
     $(SRC_DIR)/ApolloProfileMoreMenu.xm \
     $(SRC_DIR)/ApolloHiddenContentData.m \
     $(SRC_DIR)/ApolloHiddenContentViewController.m \
-    $(SRC_DIR)/ApolloHiddenContentMedia.m \
     $(SRC_DIR)/ApolloHiddenContentMediaBridge.swift \
+    $(SRC_DIR)/ApolloHiddenContentNative.xm \
     $(SRC_DIR)/ApolloHiddenContentMenu.xm \
+    $(SRC_DIR)/ApolloProfileRowWrapper.xm \
     $(SRC_DIR)/ApolloHideLinksBatchFix.xm \
     $(SRC_DIR)/ApolloSavedItemsDeduplicator.m \
     $(SRC_DIR)/ApolloSavedCategories.xm \
@@ -307,6 +317,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloYouTubeCaptions.xm \
     $(SRC_DIR)/ApolloPictureInPicture.xm \
     $(SRC_DIR)/ApolloScrollToTop.xm \
+    $(SRC_DIR)/ApolloInboxCommentScroll.xm \
     $(SRC_DIR)/ApolloFloatingTabs.xm \
     $(SRC_DIR)/ApolloFloatingTabsCrests.m \
     $(SRC_DIR)/ApolloMediaPreviewErrorFix.xm \
