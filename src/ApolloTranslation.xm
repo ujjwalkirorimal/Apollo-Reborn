@@ -13,6 +13,7 @@
 #import "ApolloCommon.h"
 #import "ApolloSwiftRuntime.h"
 #import "ApolloNavigationActions.h"
+#import "ApolloDuoRail.h"
 #import "ApolloNativeActionMenus.h"
 #import "ApolloDeletedCommentsData.h"
 #import "ApolloState.h"
@@ -104,6 +105,8 @@ static const void *kApolloGlobeStandaloneItemKey = &kApolloGlobeStandaloneItemKe
 // The right-shift the merge applied to Apollo's buttons, stored on the container
 // so removal can undo it exactly.
 static const void *kApolloGlobeMergeShiftKey = &kApolloGlobeMergeShiftKey;
+// Marks a standalone globe item built as a plain image item for the Duo rail.
+static const void *kApolloGlobeRailItemKey = &kApolloGlobeRailItemKey;
 static BOOL sApplyingGlobeMerge = NO;
 // Globe slot width inside Apollo's container. ~34pt centers the ~26pt glyph with
 // the same modest padding Apollo's own icons use, so spacing reads even.
@@ -3744,6 +3747,84 @@ static NSString *ApolloExtractGoogleSourceLanguage(id jsonObject) {
     return nil;
 }
 
+// How sure gtx is of that source language, 0–1: seventh at the top level —
+// [[segments…], null, "tl", null, null, null, 0.31, …]. clients5 reports none.
+static NSNumber *ApolloExtractGoogleSourceConfidence(id jsonObject) {
+    if (![jsonObject isKindOfClass:[NSArray class]]) return nil;
+    NSArray *array = (NSArray *)jsonObject;
+    if (array.count <= 6 || ![array[6] isKindOfClass:[NSNumber class]]) return nil;
+    double confidence = [array[6] doubleValue];
+    return (confidence >= 0.0 && confidence <= 1.0) ? array[6] : nil;
+}
+
+// At most 4 words by the system word breaker, which segments scripts written
+// without spaces (a Japanese paragraph is 17 words, not 1), and at most 40
+// characters as a backstop for a script it can't segment. Emoji and
+// punctuation alone have no words: nothing for a language guess to judge.
+static BOOL ApolloTextIsShortForLanguageGuess(NSString *text) {
+    static const NSUInteger kMaxWords = 4;
+    static const NSUInteger kMaxCharacters = 40;
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return NO;
+    NSRange all = NSMakeRange(0, text.length);
+    __block NSUInteger characters = 0;
+    [text enumerateSubstringsInRange:all
+                             options:NSStringEnumerationByComposedCharacterSequences | NSStringEnumerationSubstringNotRequired
+                          usingBlock:^(__unused NSString *s, __unused NSRange r, __unused NSRange e, BOOL *stop) {
+        if (++characters > kMaxCharacters) *stop = YES;
+    }];
+    if (characters > kMaxCharacters) return NO;
+    __block NSUInteger words = 0;
+    [text enumerateSubstringsInRange:all
+                             options:NSStringEnumerationByWords | NSStringEnumerationSubstringNotRequired
+                          usingBlock:^(__unused NSString *s, __unused NSRange r, __unused NSRange e, BOOL *stop) {
+        if (++words > kMaxWords) *stop = YES;
+    }];
+    return words > 0 && words <= kMaxWords;
+}
+
+// Accents folded away and any run of 3+ of one character counted as two.
+// Already case/whitespace-normalized input.
+static NSString *ApolloFoldSpellingNoiseForCompare(NSString *normalized) {
+    static NSRegularExpression *repeatedCharacterRun;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        repeatedCharacterRun = [NSRegularExpression regularExpressionWithPattern:@"(.)\\1{2,}" options:0 error:NULL];
+    });
+    NSString *folded = [normalized stringByFoldingWithOptions:NSDiacriticInsensitiveSearch locale:nil];
+    return [repeatedCharacterRun stringByReplacingMatchesInString:folded options:0
+                                                            range:NSMakeRange(0, folded.length)
+                                                     withTemplate:@"$1$1"];
+}
+
+// YES when the reply is the request re-spelled: a stretched word a letter
+// longer or shorter, or accents dropped or added. Only meaningful when Google
+// is unsure of the language; accents are real spelling, and a confident reply
+// that only changes them ("sí" → "sì", Spanish to Italian) is a translation.
+static BOOL ApolloGoogleReplyOnlyRespellsText(NSString *requestText, NSString *reply) {
+    NSString *requestNorm = ApolloNormalizeTextForCompare(ApolloStripInlineMediaTokens(requestText ?: @""));
+    NSString *replyNorm = ApolloNormalizeTextForCompare(ApolloStripInlineMediaTokens(reply ?: @""));
+    if (requestNorm.length == 0 || replyNorm.length == 0) return NO;
+    return [ApolloFoldSpellingNoiseForCompare(requestNorm) isEqualToString:ApolloFoldSpellingNoiseForCompare(replyNorm)];
+}
+
+// YES when Google's reply should give way to the original text: Google is
+// under 0.5 sure of the language, and the text is short or the reply only
+// re-spells it. Short text Google can't place is a name, slang or a stretched
+// word it guessed a language for, not a translation (#1665): "LUKA" + 25 A's
+// came back with 26 A's from Tagalog at 0.31, "Kuminga" as "Kumiga" from Maori
+// at 0.33, "Luka Luka Luka Luka" as "Wounds Wounds…" from Indonesian at 0.46,
+// "Vando szn" as "No. Vando" from Hungarian at 0.48. Real short foreign text
+// scores higher (Hola 1.0, Grazie 0.96, Danke 0.66, Golazo 0.52). Longer text
+// keeps Google's answer unless it only re-spells the original, since low
+// confidence there means mixed languages, which still translate fine. A long
+// post's short last chunk is judged the same way; Google misreads those too
+// ("Ja." → "And." from Estonian).
+static BOOL ApolloGoogleReplyIsUnsureGuess(NSString *requestText, NSString *reply, NSNumber *confidence) {
+    static const double kMinConfidence = 0.5;
+    if (![confidence isKindOfClass:[NSNumber class]] || confidence.doubleValue >= kMinConfidence) return NO;
+    return ApolloTextIsShortForLanguageGuess(requestText) || ApolloGoogleReplyOnlyRespellsText(requestText, reply);
+}
+
 // Completion for one provider leg: the translation plus the source language the
 // provider reports translating FROM (nil when it gave none).
 typedef void (^ApolloTranslationLegCompletion)(NSString *translated, NSString *sourceLanguage, NSError *error);
@@ -3785,8 +3866,10 @@ static NSURL *ApolloGoogleTranslateFallbackURL(NSString *text, NSString *targetL
 }
 
 // One GET against a Google translate endpoint + shared response parsing.
-// `endpointLabel` only feeds the local diagnostic log.
+// `requestText` is the text the URL carries; `endpointLabel` only feeds the
+// local diagnostic log.
 static void ApolloGoogleTranslateFetch(NSURL *url,
+                                       NSString *requestText,
                                        NSString *endpointLabel,
                                        ApolloTranslationLegCompletion completion) {
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:12.0];
@@ -3837,6 +3920,15 @@ static void ApolloGoogleTranslateFetch(NSURL *url,
         }
 
         NSString *sourceLanguage = ApolloExtractGoogleSourceLanguage(jsonObject);
+        NSNumber *confidence = ApolloExtractGoogleSourceConfidence(jsonObject);
+        if (ApolloGoogleReplyIsUnsureGuess(requestText, translated, confidence)) {
+            // Hand the original back, the way a skip-listed language is: callers
+            // treat it as nothing to translate, so no rewrite and no marker.
+            ApolloLog(@"[Translation] Google(%@) only %.2f sure the %lu-char text is %@ — keeping the original",
+                      endpointLabel, confidence.doubleValue, (unsigned long)requestText.length, sourceLanguage ?: @"(none)");
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(requestText, nil, nil); });
+            return;
+        }
         dispatch_async(dispatch_get_main_queue(), ^{ completion(translated, sourceLanguage, nil); });
     }];
 
@@ -3865,7 +3957,7 @@ static void ApolloTranslateViaGoogle(NSString *text,
             completion(nil, nil, primaryError);
             return;
         }
-        ApolloGoogleTranslateFetch(fallbackURL, @"clients5", ^(NSString *retried, NSString *retriedSource, NSError *fallbackError) {
+        ApolloGoogleTranslateFetch(fallbackURL, text, @"clients5", ^(NSString *retried, NSString *retriedSource, NSError *fallbackError) {
             if ([retried isKindOfClass:[NSString class]] && retried.length > 0) {
                 completion(retried, retriedSource, nil);
                 return;
@@ -3892,7 +3984,7 @@ static void ApolloTranslateViaGoogle(NSString *text,
         dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, nil, error); });
         return;
     }
-    ApolloGoogleTranslateFetch(primaryURL, @"gtx", ^(NSString *translated, NSString *sourceLanguage, NSError *primaryError) {
+    ApolloGoogleTranslateFetch(primaryURL, text, @"gtx", ^(NSString *translated, NSString *sourceLanguage, NSError *primaryError) {
         if ([translated isKindOfClass:[NSString class]] && translated.length > 0) {
             completion(translated, sourceLanguage, nil);
             return;
@@ -5049,7 +5141,7 @@ void ApolloTranslationDebugProbe(NSString *spec) {
     } else if ([leg isEqualToString:@"google2"]) {
         NSURL *fallbackURL = ApolloGoogleTranslateFallbackURL(text, target);
         if (!fallbackURL) { ApolloLog(@"[Translation][Probe] clients5 URL build failed"); return; }
-        ApolloGoogleTranslateFetch(fallbackURL, @"clients5", report);
+        ApolloGoogleTranslateFetch(fallbackURL, text, @"clients5", report);
     } else if ([leg isEqualToString:@"libre"]) {
         ApolloTranslateViaLibre(text, target, report);
     } else if ([leg isEqualToString:@"microsoft"]) {
@@ -7918,6 +8010,13 @@ static UIView *ApolloStandaloneGlobeView(UIButton *globe) {
 // custom-view UIView that holds at least one UIButton OTHER than our globe.
 static UIView *ApolloFindTrailingButtonContainerInItems(NSArray<UIBarButtonItem *> *items, UIButton *globe) {
     for (UIBarButtonItem *item in items) {
+        // The opened Duo's List/Split/Layout controls are custom views with
+        // buttons too, but not Apollo's action strip: merging into one parks
+        // the globe in the top bar beside Layout.
+        if (@available(iOS 26.0, *)) {
+            if ([item.identifier hasPrefix:@"ApolloReborn.duo-"]) continue;
+        }
+        if ([item.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"]) continue;
         UIView *cv = ApolloNavigationActionsContentView(item);
         if (![cv isKindOfClass:[UIView class]]) continue;
         BOOL hasOtherButton = NO;
@@ -8088,6 +8187,29 @@ static void ApolloMergeGlobeIntoContainer(UIButton *globe, UIView *container) {
 
 }
 
+// One navigation glyph for the original UIButton, its Duo mirror, standalone
+// rail item and overflow action. A symbol's font metrics can be reinterpreted
+// by each host; a fixed canvas keeps the visible size stable during transitions.
+static UIImage *ApolloTranslationNavigationIcon(void) {
+    static UIImage *image;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        UIImage *symbol = [UIImage systemImageNamed:@"globe"
+            withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:20.0 weight:UIImageSymbolWeightRegular]];
+        // The symbol includes optical padding: a 26pt canvas gives a ~22pt globe.
+        const CGFloat side = 26.0;
+        CGFloat scale = MIN(side / symbol.size.width, side / symbol.size.height);
+        CGSize size = CGSizeMake(symbol.size.width * scale, symbol.size.height * scale);
+        CGRect rect = CGRectMake((side - size.width) / 2.0, (side - size.height) / 2.0, size.width, size.height);
+        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)];
+        image = [[renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+            // Fit the complete symbol canvas, without cropping its alpha bounds.
+            [symbol drawInRect:rect];
+        }] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    });
+    return image;
+}
+
 // Merge into the trailing cluster, or retain a standalone item when absent.
 static void ApolloApplyGlobeMergeForNavItem(UINavigationItem *navItem) {
     if (!navItem) return;
@@ -8106,14 +8228,17 @@ static void ApolloApplyGlobeMergeForNavItem(UINavigationItem *navItem) {
     if (ApolloDeferGlobeGeometry(globe, container, ^{
         ApolloApplyGlobeMergeForNavItem(weakItem);
     })) return;
-    // Liquid Glass uses the same neutral chrome in standalone and merged slots.
+    // Liquid Glass uses the other navigation buttons' color in standalone and
+    // merged slots: neutral chrome, or the accent with Accent Navigation Buttons.
     // Classic builds keep their accent and translated-state tint.
     id target = globe.allTargets.anyObject;
     UIViewController *controller = [target isKindOfClass:UIViewController.class] ? target : nil;
     BOOL visibleTranslationApplied = [objc_getAssociatedObject(controller, kApolloVisibleTranslationAppliedKey) boolValue];
-    globe.tintColor = IsLiquidGlass() ? ApolloNavigationChromeColor()
+    UIColor *buttonAccent = ApolloNavigationButtonAccentColor();
+    globe.tintColor = IsLiquidGlass() ? (buttonAccent ?: ApolloNavigationChromeColor())
         : (visibleTranslationApplied ? UIColor.systemGreenColor
             : (ApolloThemeAccentColor() ?: controller.viewIfLoaded.tintColor ?: UIColor.systemBlueColor));
+    if (IsLiquidGlass()) ApolloNavigationActionsAccentControl(globe);
     UIBarButtonItem *standalone = objc_getAssociatedObject(navItem, kApolloGlobeStandaloneItemKey);
 
     // The Duo rail already mirrors the merged globe as a native item. Leave it
@@ -8190,6 +8315,68 @@ static void ApolloApplyGlobeMergeForNavItem(UINavigationItem *navItem) {
     // only trailing button is a plain image item — PostsSearchResultsViewController
     // with its sort bullseye — live on this path permanently.
     ApolloDetachGlobeFromContainer(globe);  // only unpacks a container we merged into
+    // On the Duo's vertical rail a custom-view item cannot sit on the platter;
+    // UIKit parks it in the top bar. Use a plain image item there instead,
+    // forwarding to the globe button, and swap kinds when the rail comes or goes.
+    BOOL railActive = ApolloDuoRailHasVisibleSideBar();
+    BOOL railKind = objc_getAssociatedObject(standalone, kApolloGlobeRailItemKey) != nil;
+    if (standalone && railKind != railActive) {
+        NSMutableArray<UIBarButtonItem *> *its = [navItem.rightBarButtonItems mutableCopy];
+        if ([its containsObject:standalone]) {
+            [its removeObject:standalone];
+            sApplyingGlobeMerge = YES;
+            navItem.rightBarButtonItems = its;
+            sApplyingGlobeMerge = NO;
+        }
+        if (!railKind && ApolloStandaloneItemHostsGlobe(standalone, globe)) standalone.customView = nil;
+        standalone = nil;
+        objc_setAssociatedObject(navItem, kApolloGlobeStandaloneItemKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (railActive) {
+        UIImage *railImage = ApolloTranslationNavigationIcon();
+        if (!standalone) {
+            __weak UIButton *weakGlobe = globe;
+            UIImage *image = railImage;
+            standalone = [[UIBarButtonItem alloc] initWithPrimaryAction:[UIAction actionWithTitle:@"Translate" image:image identifier:nil
+                                                                                          handler:^(__unused UIAction *action) {
+                [weakGlobe sendActionsForControlEvents:UIControlEventTouchUpInside];
+            }]];
+            objc_setAssociatedObject(standalone, kApolloGlobeRailItemKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(navItem, kApolloGlobeStandaloneItemKey, standalone, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            ApolloLog(@"[Translation] Globe: hosting as a native Duo rail item (title length %lu)", (unsigned long)navItem.title.length);
+        }
+        if (standalone.image != railImage) standalone.image = railImage;
+        if (standalone.tintColor != buttonAccent) standalone.tintColor = buttonAccent;
+        if (standalone.primaryAction.image != railImage) standalone.primaryAction.image = railImage;
+        if (![standalone.primaryAction.title isEqualToString:@"Translate"])
+            standalone.primaryAction.title = @"Translate";
+        if (@available(iOS 16.0, *)) {
+            // The handler and glyph are stable for this item's lifetime. A new
+            // action on every delayed refresh makes UIKit reconfigure the rail.
+            if (!standalone.menuRepresentation) {
+                UIAction *menuAction = [standalone.primaryAction copy];
+                menuAction.image = railImage;
+                standalone.menuRepresentation = menuAction;
+            }
+        }
+        if (![standalone.accessibilityLabel isEqualToString:@"Translate"])
+            standalone.accessibilityLabel = @"Translate";
+        if (![standalone.accessibilityHint isEqualToString:globe.accessibilityLabel])
+            standalone.accessibilityHint = globe.accessibilityLabel;
+        if (@available(iOS 26.0, *)) {
+            if (!standalone.sharesBackground) standalone.sharesBackground = YES;
+            if (standalone.hidesSharedBackground) standalone.hidesSharedBackground = NO;
+        }
+        if (![standalone.title isEqualToString:@"Translate"]) standalone.title = @"Translate";
+        NSMutableArray<UIBarButtonItem *> *its = [navItem.rightBarButtonItems mutableCopy] ?: [NSMutableArray array];
+        if (![its containsObject:standalone]) {
+            [its addObject:standalone];
+            sApplyingGlobeMerge = YES;
+            navItem.rightBarButtonItems = its;
+            sApplyingGlobeMerge = NO;
+        }
+        return;
+    }
     if (standalone && ApolloStandaloneItemHostsGlobe(standalone, globe) && [navItem.rightBarButtonItems containsObject:standalone]) {
         return;  // already hosted as its own item — leave UIKit's wrapper alone
     }
@@ -8362,7 +8549,9 @@ static void ApolloNormalizeTrailingPillPaddingForNavItem(UINavigationItem *navIt
 
 static void ApolloUpdateTranslationUIForController(id controller) {
     UIViewController *vc = (UIViewController *)controller;
-    if (!sEnableBulkTranslation) return;
+    // Translation switched off: still run the cleanup below for a page that
+    // already shows the globe, or it lingers (merged, standalone or on the Duo rail).
+    if (!sEnableBulkTranslation && !objc_getAssociatedObject(vc.navigationItem, kApolloGlobeMergeButtonKey)) return;
 
     BOOL isFeedVC = [objc_getAssociatedObject(controller, kApolloFeedTranslationVCKey) boolValue];
     // Comments VCs require sEnableBulkTranslation.
@@ -8389,7 +8578,7 @@ static void ApolloUpdateTranslationUIForController(id controller) {
     BOOL translatedMode = ApolloControllerIsInTranslatedMode(vc);
     NSString *targetName = ApolloLocalizedTargetLanguageName();
 
-    UIImage *globeImage = [[UIImage systemImageNamed:@"globe"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    UIImage *globeImage = ApolloTranslationNavigationIcon();
 
     UIButton *globeButton = objc_getAssociatedObject(vc.navigationItem, kApolloGlobeMergeButtonKey);
     if (!globeButton) {
@@ -8397,7 +8586,8 @@ static void ApolloUpdateTranslationUIForController(id controller) {
         globeButton.frame = CGRectMake(0.0, 0.0, 36.0, 32.0);
         [globeButton addTarget:controller action:@selector(apollo_translationGlobeTapped) forControlEvents:UIControlEventTouchUpInside];
     }
-    [globeButton setImage:globeImage forState:UIControlStateNormal];
+    if ([globeButton imageForState:UIControlStateNormal] != globeImage)
+        [globeButton setImage:globeImage forState:UIControlStateNormal];
 
     globeButton.accessibilityLabel = translatedMode
         ? @"Translation: showing translated. Tap to show original."
@@ -10603,7 +10793,13 @@ static void ApolloScheduleFeedSettledTitleRefresh(UIViewController *vc) {
 
 static void ApolloFeedVCInstallGlobe(UIViewController *vc) {
     if (!vc) return;
-    if (!sEnableBulkTranslation) return;
+    if (!sEnableBulkTranslation) {
+        // Switched off while this feed showed its globe: remove it.
+        if (objc_getAssociatedObject(vc.navigationItem, kApolloGlobeMergeButtonKey)) {
+            ApolloRemoveGlobeMergeForNavItem(vc.navigationItem);
+        }
+        return;
+    }
     BOOL alreadyMarked = [objc_getAssociatedObject(vc, kApolloFeedTranslationVCKey) boolValue];
     objc_setAssociatedObject(vc, kApolloFeedTranslationVCKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     sLastInstalledFeedViewController = vc;
@@ -11676,7 +11872,23 @@ static void ApolloDbgPurgeNSCaches(CFNotificationCenterRef c, void *o, CFStringR
 #endif
 // ==============================================================================
 
+static void ApolloGlobeCollectNavigationItems(UIView *view, NSMutableArray<UINavigationItem *> *items) {
+    if ([view isKindOfClass:UINavigationBar.class]) {
+        [items addObjectsFromArray:((UINavigationBar *)view).items ?: @[]];
+        return;
+    }
+    for (UIView *subview in view.subviews) ApolloGlobeCollectNavigationItems(subview, items);
+}
+
 %ctor {
+    // Accent Navigation Buttons: recolor the globes already in navigation bars.
+    [NSNotificationCenter.defaultCenter addObserverForName:ApolloNavigationButtonColorDidChangeNotification
+                                                    object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) {
+        NSMutableArray<UINavigationItem *> *items = [NSMutableArray array];
+        for (UIWindow *window in ApolloAllWindows()) ApolloGlobeCollectNavigationItems(window, items);
+        for (UINavigationItem *item in items) ApolloApplyGlobeMergeForNavItem(item);
+    }];
     // Apollo's native General > Other section has an "Always Offer Translate" row
     // that is redundant (and confusing) next to this module's own Translation
     // feature; hide it. The underlying Apollo setting is untouched, and the table

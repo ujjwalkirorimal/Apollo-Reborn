@@ -61,6 +61,10 @@
 // media viewer's swipe-up comments sheet.
 extern "C" BOOL ApolloSwipeCommentsIsPaneCommentsController(UIViewController *controller);
 
+// ApolloInboxCommentScroll.xm: YES for a thread that opens on a linked comment
+// (an Inbox reply, a comment permalink) rather than at the top of the post.
+extern "C" BOOL ApolloInboxCommentScrollLandsOnLinkedComment(UIViewController *vc);
+
 // Forward ref for the geometry hooks (same pattern as ApolloSearchInPlace.xm).
 @interface ASTableView : UITableView
 @end
@@ -152,6 +156,7 @@ static const void *kNSBBridgeKey     = &kNSBBridgeKey;      // VC -> bridge dele
 static const void *kNSBNativeBarKey  = &kNSBNativeBarKey;   // UISearchBar -> @YES for the bars this module attaches
 static const void *kNSBFeedTableKey  = &kNSBFeedTableKey;   // ASTableView -> @YES (native-managed table: a feed, or a comments screen)
 static const void *kNSBAppearedKey   = &kNSBAppearedKey;    // VC -> @YES once it has appeared at least once
+static const void *kNSBParkedForLandingKey = &kNSBParkedForLandingKey; // VC -> @YES: attached scrolled away for a linked comment, until it first appears
 // How far above the safe area a resting write may sit and still count as one:
 // the toolbar band (45pt fresh, 37pt on a feed restored after a post) plus
 // room for the taller values Apollo computes mid nav-morph.
@@ -339,15 +344,28 @@ static UIScrollView *NSBTableForVC(UIViewController *vc) {
     return (UIScrollView *)tv;
 }
 
+// MARK: - Feed controller lookup
+
+// A screen being torn down can still sit in its views' responder chain while
+// Texture flushes a last batch update into its table. Forming a weak reference
+// to it then is fatal in the runtime, so such a screen is treated as gone.
+static BOOL NSBIsDeallocating(id object) {
+    return [object respondsToSelector:@selector(_isDeallocating)] &&
+           ((BOOL (*)(id, SEL))objc_msgSend)(object, @selector(_isDeallocating));
+}
+
 static UIViewController *NSBFeedVCForView(UIView *view) {
     UIResponder *r = view.nextResponder;
     int guard = 0;
     while (r && guard++ < 40) {
-        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+        if ([r isKindOfClass:[UIViewController class]])
+            return NSBIsDeallocating(r) ? nil : (UIViewController *)r;
         r = r.nextResponder;
     }
     return nil;
 }
+
+// MARK: - End feed controller lookup
 
 // MARK: - Driving Apollo's pipeline
 
@@ -989,11 +1007,16 @@ NSArray<UIBarButtonItem *> *ApolloNativeFeedSearchDuoTrailingItems(UINavigationI
     // Apollo rebuilds its trailing actions when comments appear or their sort
     // changes. Keep the registered host control in that same update instead
     // of removing it and adding it back on the next layout pass.
-    NSMutableArray *result = [trailing mutableCopy];
+    NSMutableArray *result = [NSMutableArray array];
     for (UIBarButtonItem *candidate in items) {
         if (![candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"])
             [result addObject:candidate];
     }
+    // rightBarButtonItems is trailing-first. Keep horizontal host controls at
+    // the other end, so their separate glass section cannot sit between the
+    // vertical page actions and UIKit's generated overflow section. UIKit
+    // still places Feed Layout in the top bar, but the rail now shares a pill.
+    [result addObjectsFromArray:trailing];
     return result;
 }
 
@@ -1003,20 +1026,16 @@ static void NSBUpdateDuoControls(UIViewController *vc) {
     if (@available(iOS 27.0, *)) {
         UINavigationItem *item = vc.navigationItem;
         NSArray *leading = objc_getAssociatedObject(vc, &kNSBDuoLeadingControlsKey) ?: @[];
-        BOOL hasSplitControl = NO;
-        for (UIBarButtonItem *control in leading) {
-            if ([control.identifier isEqualToString:@"ApolloReborn.duo-split"]) hasSplitControl = YES;
-        }
         NSMutableArray *left = [NSMutableArray array];
         NSMutableArray *right = [NSMutableArray array];
         NSMutableArray *returnItems = [NSMutableArray array];
         for (UIBarButtonItem *candidate in item.leftBarButtonItems) {
             if ([candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"]) continue;
-            // In opened landscape, keep List and Split anchored at the edge
-            // when Return appears. Native Back stays ahead of those controls.
-            // The host's registered Split item also follows rotation, without
-            // imposing this order on ordinary phones or opened portrait.
-            if (hasSplitControl && [candidate.customView.accessibilityIdentifier isEqualToString:@"apollo.scrollReturn"])
+            // Keep the host's controls anchored at the edge when Return
+            // appears, in every pose. Native Back stays ahead of them. Putting
+            // Return first in portrait moved it to the edge whenever the
+            // drawer or a layout pass rebuilt these items.
+            if ([candidate.customView.accessibilityIdentifier isEqualToString:@"apollo.scrollReturn"])
                 [returnItems addObject:candidate];
             else
                 [left addObject:candidate];
@@ -1044,12 +1063,14 @@ static void NSBUpdateDuoControls(UIViewController *vc) {
 }
 
 void ApolloNativeFeedSearchSetDuoControls(UIViewController *vc, UIBarButtonItem *list,
-                                        UIBarButtonItem *split, UIBarButtonItem *layout) {
+                                        UIBarButtonItem *split, UIBarButtonItem *layout,
+                                        BOOL layoutLeading) {
     if (!vc) return;
     NSMutableArray *leading = [NSMutableArray array];
     if (list) [leading addObject:list];
+    if (layout && layoutLeading) [leading addObject:layout];
     if (split) [leading addObject:split];
-    NSArray *trailing = layout ? @[layout] : @[];
+    NSArray *trailing = layout && !layoutLeading ? @[layout] : @[];
     for (UIBarButtonItem *control in [leading arrayByAddingObjectsFromArray:trailing])
         control.accessibilityIdentifier = @"ApolloDuoFeedControl";
     objc_setAssociatedObject(vc, &kNSBDuoLeadingControlsKey, [leading copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1061,10 +1082,12 @@ static void NSBUpdateSearchPlacement(UIViewController *vc) {
     if (@available(iOS 16.0, *)) {
         UINavigationItem *item = vc.navigationItem;
         // Every Duo pose keeps the field beneath the title. The live rail
-        // also identifies closed landscape, whose bounds classify as Phone.
+        // also identifies closed landscape, and the Duo check a video pinned
+        // above Apollo; both windows classify as Phone.
         BOOL stacked = ApolloDuoSplitIsUnfolded();
         if (@available(iOS 27.0, *)) {
-            stacked |= ApolloDuoCurrentMode() != ApolloDuoModePhone || ApolloDuoRailHasVisibleSideBar();
+            stacked |= ApolloDuoCurrentMode() != ApolloDuoModePhone || ApolloDuoRailHasVisibleSideBar()
+                || ApolloDuoDeviceDetected();
         }
         NSNumber *original = objc_getAssociatedObject(item, &kNSBDuoSearchPlacementKey);
         if (stacked && !original) {
@@ -1143,9 +1166,22 @@ static void NSBAttachNativeSearch(UIViewController *vc) {
 
     // Attach laid-out-visible; the scroll-away policy flips it after the first
     // appearance (plain YES here parks the bar off-screen — no large title).
+    // Except a thread that opens on a linked comment: the landing scrolls it
+    // straight past the post, so the bar was on screen for the push and then
+    // vanished a beat after the comment landed, when the policy flipped. Park it
+    // instead: the push lays it out scrolled away, it stays that way at the
+    // comment, and it comes back like any scrolled-away bar (a pull at the top
+    // of the post). viewDidAppear skips the
+    // appearance reveal for it, so a short thread that lands at the top rest
+    // doesn't push everything down a bar's height once it's on screen.
+    BOOL parkForLanding = comments && objc_getAssociatedObject(vc, kNSBAppearedKey) == nil &&
+                          ApolloInboxCommentScrollLandsOnLinkedComment(vc);
     navItem.searchController = sc;
     ApolloPaneApplySearchPlacement(vc);
-    navItem.hidesSearchBarWhenScrolling = NO;
+    navItem.hidesSearchBarWhenScrolling = parkForLanding;
+    if (parkForLanding) {
+        objc_setAssociatedObject(vc, kNSBParkedForLandingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 
     // Point UIKit's bar collapse tracking at the actual feed table — automatic
     // detection lands on Apollo's full-screen intercepting scroll view, which
@@ -1171,7 +1207,8 @@ static void NSBAttachNativeSearch(UIViewController *vc) {
     // other holds), UIKit draws it inside the band; keep the look it has once
     // the scroll-away policy takes over (ApolloScrollEdgeEffect.xm, #1361).
     ApolloHeaderStyleRegisterScrollAwaySearchBar(sc.searchBar, navItem, table);
-    ApolloLog(@"[NativeSearch] attached search controller to %s", object_getClassName(vc));
+    ApolloLog(@"[NativeSearch] attached search controller to %s%s", object_getClassName(vc),
+              parkForLanding ? " (scrolled away: opens on a linked comment)" : "");
 }
 
 // Hide Apollo's own toolbar (the resting pill inside the feed). Re-asserted
@@ -1618,8 +1655,10 @@ void ApolloNativeFeedSearchFinishColumnMove(UIViewController *vc) {
 // pulled it down by hand. The feed's own geometry setters DO run on those
 // paths, so ask from there as well, coalesced to one check per runloop turn.
 static void NSBScheduleRevealCheck(UIScrollView *table) {
+    // Off screen there is no bar to reveal: a closed thread's table can still
+    // receive Texture updates after its screen has gone.
+    if (!table.window) return;
     if (ApolloPaneUsesUnifiedChrome(table)) return;
-    if (!table) return;
     if (objc_getAssociatedObject(table, kNSBFeedTableKey) == nil) return;
     UIViewController *vc = NSBFeedVCForView(table);
     ApolloNativeSearchRestingState *state = NSBRestingStateForVC(vc);
@@ -1701,6 +1740,10 @@ static void NSBViewWillDisappear(UIViewController *vc) {
     // Fresh notes: the next viewWillAppear: is a new appearance even if it
     // arrives inside the transition this one ran in (a cancelled pop).
     leavingState.notesTransition = nil;
+    // A push into a linked-comment thread that never finished appearing (a
+    // cancelled forward swipe) leaves the park note unspent; it was for that
+    // first appearance only.
+    objc_setAssociatedObject(vc, kNSBParkedForLandingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (NSBTraceEnabled()) {
         ApolloLog(@"[NSBTrace] leaving: y=%.1f adjTop=%.1f bar=%.1f -> leftAtTop=%d leftCollapsedAtRest=%d",
                   leavingTable.contentOffset.y, leavingTable.adjustedContentInset.top,
@@ -1870,7 +1913,11 @@ static void NSBViewWillDisappear(UIViewController *vc) {
     // Cancellation sends didAppear from inside completeTransition:, before
     // UIKit finishes restoring the palette. Read its geometry next turn.
     UIScrollView *appearedTable = NSBTableForVC((UIViewController *)self);
-    if (!appearedState.keepCollapsedOnAppear) NSBArmReveal(appearedTable, "appeared");
+    // A bar parked for a linked comment (NSBAttachNativeSearch) stays away on
+    // its first appearance, the same as one the user left scrolled away.
+    BOOL parkedForLanding = objc_getAssociatedObject(self, kNSBParkedForLandingKey) != nil;
+    objc_setAssociatedObject(self, kNSBParkedForLandingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!appearedState.keepCollapsedOnAppear && !parkedForLanding) NSBArmReveal(appearedTable, "appeared");
     // A Duo column move the split did not finish repairs here
     // (ApolloNativeFeedSearchFinishColumnMove).
     ApolloNativeFeedSearchFinishColumnMove((UIViewController *)self);

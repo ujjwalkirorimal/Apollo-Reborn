@@ -275,6 +275,26 @@ void ApolloDuoRailPrepareTableForTransition(UITableView *table) {
 // before the transition and restore it once the new layout commits.
 static char kApolloDuoFoldAnchorKey;
 
+// The anchor's restore passes run after the transition and again 0.3s later.
+// A scroll the reader starts in that window wins: restoring after the finger
+// lifts would put the feed back and make the first scroll look ignored.
+@interface ApolloDuoFoldAnchorDragObserver : NSObject
++ (instancetype)shared;
+- (void)panChanged:(UIPanGestureRecognizer *)pan;
+@end
+@implementation ApolloDuoFoldAnchorDragObserver
++ (instancetype)shared {
+    static ApolloDuoFoldAnchorDragObserver *observer;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ observer = [self new]; });
+    return observer;
+}
+- (void)panChanged:(UIPanGestureRecognizer *)pan {
+    if (pan.state != UIGestureRecognizerStateBegan) return;
+    objc_setAssociatedObject(pan.view, &kApolloDuoFoldAnchorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+@end
+
 static void ApolloDuoCollectVisibleTables(UIView *view, NSMutableArray<UITableView *> *tables, NSUInteger depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 24) return;
     if (ApolloClassASTableView && [view isKindOfClass:ApolloClassASTableView]) {
@@ -305,6 +325,9 @@ static void ApolloDuoCaptureFoldAnchor(UITableView *table) {
         CGFloat fraction = rect.size.height > 0.0 ? (visibleTop - CGRectGetMinY(rect)) / rect.size.height : 0.0;
         objc_setAssociatedObject(table, &kApolloDuoFoldAnchorKey,
             @[path, @(MAX(0.0, MIN(1.0, fraction)))], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // UIKit ignores a target-action pair that is already registered.
+        [table.panGestureRecognizer addTarget:[ApolloDuoFoldAnchorDragObserver shared]
+                                       action:@selector(panChanged:)];
         return;
     }
 }
@@ -338,13 +361,18 @@ static BOOL sApolloDuoClampingFloatingButton;
 static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
     if (sApolloDuoClampingFloatingButton) return;
     sApolloDuoClampingFloatingButton = YES;
+    UIViewController *owner = nil;
     for (UIResponder *responder = button.nextResponder; responder; responder = responder.nextResponder) {
         if ([responder isKindOfClass:UIViewController.class]) {
-            ApolloDuoRailAdjustHideReadButton((UIViewController *)responder);
+            owner = (UIViewController *)responder;
+            ApolloDuoRailAdjustHideReadButton(owner);
             break;
         }
     }
-    ApolloDuoCoverAdjustJumpButton(sApolloDuoActiveComments);
+    // Back to another thread makes the arriving one active first.
+    ApolloDuoCoverAdjustJumpButton(owner);
+    UIViewController *active = sApolloDuoActiveComments;
+    if (active != owner) ApolloDuoCoverAdjustJumpButton(active);
     sApolloDuoClampingFloatingButton = NO;
 }
 
@@ -352,9 +380,12 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
 
 %hook _TtC6Apollo22ApolloTabBarController
 
+// The tab bar swipe's lens check runs here and after a transition (below):
+// in sim builds this subclass hook hides later UITabBarController hooks (AGENTS.md).
 - (void)viewDidLayoutSubviews {
     %orig;
     ApolloDuoRailSync();
+    ApolloTabBarSwipeScheduleLensCheck((UITabBarController *)self);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -392,6 +423,8 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
         dispatch_async(dispatch_get_main_queue(), ^{
             ApolloDuoRailSync();
             for (UITableView *table in tables) ApolloDuoRestoreFoldAnchor(table, NO);
+            UIViewController *tabs = ApolloMainTabBarController();
+            if ([tabs isKindOfClass:UITabBarController.class]) ApolloTabBarSwipeScheduleLensCheck((UITabBarController *)tabs);
         });
         // Media and Focused cards can settle their heights a beat later.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -576,6 +609,12 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
 %hook _TtC6Apollo22CommentsViewController
 
 - (void)viewDidLayoutSubviews {
+    %orig;
+    ApolloDuoCoverAdjustJumpButton((UIViewController *)self);
+}
+
+// Starting Back moves the page's frame off screen, changing its safe area.
+- (void)viewSafeAreaInsetsDidChange {
     %orig;
     ApolloDuoCoverAdjustJumpButton((UIViewController *)self);
 }

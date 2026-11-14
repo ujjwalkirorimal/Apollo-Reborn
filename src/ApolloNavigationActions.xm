@@ -3,18 +3,22 @@
 #import "ApolloNavigationActions.h"
 #import "ApolloNavigationActionsDiscovery.h"
 #import "ApolloNativeActionMenus.h"
+#import "ApolloActionMenu.h"
+#import "ApolloTranslation.h"
 #import "ApolloCommon.h"
 #import "ApolloDuoCompatibility.h"
 #import "ApolloDuoRail.h"
 #import "ApolloState.h"
 #import "ApolloThemeRuntime.h"
 #import "ApolloSearchNativeBar.h"
+#import "UserDefaultConstants.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 #import <QuartzCore/QuartzCore.h>
 #import "ApolloClasses.h"
 
-extern NSArray<UIBarButtonItem *> *ApolloDuoCommentsLayoutItems(UINavigationItem *item, NSArray<UIBarButtonItem *> *items);
+extern NSArray<UIBarButtonItem *> *ApolloDuoPageLayoutItems(UINavigationItem *item, NSArray<UIBarButtonItem *> *items);
 
 // Use the pill's spring for glyphs without changing button frames,
 // which translation measures when inserting its globe.
@@ -56,6 +60,7 @@ static char kActionsDuoOriginalItemsKey;
 static char kActionsDuoNativeItemsKey;
 static char kActionsDuoSourceButtonKey;
 static char kActionsDuoMirroredItemsKey;
+static char kActionsDuoMirroredImageKey;
 static char kActionsDuoRefreshScheduledKey;
 static char kActionsDuoProfileAppliedKey;
 static char kActionsDuoProfileRefreshKey;
@@ -89,6 +94,32 @@ static UIColor *ApolloActionsAccentSubmitColor(void) {
     return color;
 }
 
+// Accent Navigation Buttons: the color pinned navigation buttons take. The
+// accent provider is rebuilt when the theme changes, or the buttons would
+// keep the old provider's last render. Providers built from one block compare
+// equal, so each captures its own generation for the pins to see a new color.
+static UIColor *sActionsButtonAccent;
+static NSUInteger sActionsButtonAccentGeneration;
+static NSHashTable *sActionsPinned;   // weak; everything ApolloActionsPinChrome tinted
+
+NSNotificationName const ApolloNavigationButtonColorDidChangeNotification = @"ApolloNavigationButtonColorDidChangeNotification";
+
+UIColor *ApolloNavigationButtonAccentColor(void) {
+    if (!sAccentNavigationButtons || !IsLiquidGlass()) return nil;
+    if (!sActionsButtonAccent) {
+        NSUInteger generation = ++sActionsButtonAccentGeneration;
+        sActionsButtonAccent = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+            (void)generation;
+            return [(ApolloThemeAccentColor() ?: UIColor.systemBlueColor) resolvedColorWithTraitCollection:traits];
+        }];
+    }
+    return sActionsButtonAccent;
+}
+
+static UIColor *ApolloActionsButtonColor(void) {
+    return ApolloNavigationButtonAccentColor() ?: ApolloNavigationChromeColor();
+}
+
 // Keep right-item chrome neutral before it appears, including lone actions on
 // profile feeds. Mark only the actual item content, never the whole nav bar.
 static UIColor *ApolloActionsChromeColor(id object) {
@@ -97,7 +128,8 @@ static UIColor *ApolloActionsChromeColor(id object) {
     }
     if (@available(iOS 26.0, *)) {
         if ([object isKindOfClass:UIBarButtonItem.class]
-            && [((UIBarButtonItem *)object).identifier isEqualToString:@"ApolloReborn.subreddits.edit"]
+            && ([((UIBarButtonItem *)object).identifier isEqualToString:@"ApolloReborn.subreddits.edit"]
+                || [((UIBarButtonItem *)object).identifier isEqualToString:@"ApolloReborn.filters.edit"])
             && ((UIBarButtonItem *)object).style == UIBarButtonItemStyleProminent) {
             return UIColor.systemBlueColor;
         }
@@ -106,10 +138,12 @@ static UIColor *ApolloActionsChromeColor(id object) {
         return ApolloActionsAccentSubmitColor();
     }
     return [objc_getAssociatedObject(object, &kActionsBlueDoneKey) boolValue]
-        ? UIColor.systemBlueColor : ApolloNavigationChromeColor();
+        ? UIColor.systemBlueColor : ApolloActionsButtonColor();
 }
 
 static void ApolloActionsPinChrome(id object) {
+    if (!sActionsPinned) sActionsPinned = [NSHashTable weakObjectsHashTable];
+    [sActionsPinned addObject:object];
     UIColor *chrome = ApolloActionsChromeColor(object);
     if (!objc_getAssociatedObject(object, &kActionsChromeKey) ||
         ![[object tintColor] isEqual:chrome]) {
@@ -309,6 +343,7 @@ static void ApolloActionsApplyChromeToView(UIView *view, BOOL blueDone) {
 @property (nonatomic) BOOL needsGeometryTransition;
 @property (nonatomic) BOOL geometryDeferred;
 @property (nonatomic) BOOL needsAnimationSettlement;
+@property (nonatomic) BOOL collapseWhenAnimationEnds;
 - (BOOL)collapseEnabled;
 - (void)prepareItems:(NSArray<UIBarButtonItem *> *)items;
 - (BOOL)deferGeometryUpdate;
@@ -683,7 +718,7 @@ static BOOL ApolloActionsArraysIdentical(NSArray *a, NSArray *b) {
 
 static BOOL ApolloActionsIsDuoFeedControl(UINavigationItem *item, UIBarButtonItem *candidate) {
     if ([candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"] ||
-        [candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoCommentsLayoutControl"]) return YES;
+        [candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoPageLayoutControl"]) return YES;
     if (@available(iOS 27.0, *)) return candidate == item.searchBarPlacementBarButtonItem;
     return NO;
 }
@@ -1077,6 +1112,7 @@ static UIBarButtonItem *ApolloActionsNativeItemForDuoButton(UIButton *button, NS
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     [mirrors addObject:item];
+    objc_setAssociatedObject(item, &kActionsDuoMirroredImageKey, image, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return item;
 }
 
@@ -1111,7 +1147,12 @@ static NSArray<UIBarButtonItem *> *ApolloActionsWithoutDuoMirrors(UINavigationIt
         if (ApolloActionsFindMore(ApolloNavigationActionsContentView(candidate))) hasComposite = YES;
     }
     if (!hasComposite && original.count) {
-        NSArray *originalActions = ApolloActionsWithoutDuoFeedControls(item, original);
+        // Only the composite: the page's other items are already in `kept`,
+        // and the cached copies may be gone from the page by now.
+        NSMutableArray *originalActions = [NSMutableArray array];
+        for (UIBarButtonItem *candidate in ApolloActionsWithoutDuoFeedControls(item, original)) {
+            if (ApolloActionsFindMore(ApolloNavigationActionsContentView(candidate))) [originalActions addObject:candidate];
+        }
         [kept insertObjects:originalActions
                   atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(firstMirror, originalActions.count)]];
     }
@@ -1120,10 +1161,182 @@ static NSArray<UIBarButtonItem *> *ApolloActionsWithoutDuoMirrors(UINavigationIt
     return kept;
 }
 
+static BOOL ApolloActionsButtonActionContains(UIButton *button, NSString *needle) {
+    for (id target in button.allTargets) {
+        for (NSString *action in [button actionsForTarget:target forControlEvent:UIControlEventTouchUpInside]) {
+            if ([action.lowercaseString containsString:needle]) return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL ApolloActionsIsModeratorButton(UIButton *button) {
+    return [button.accessibilityLabel.lowercaseString containsString:@"moderator"]
+        || ApolloActionsButtonActionContains(button, @"moderator");
+}
+
+static BOOL ApolloActionsIsSortButton(UIButton *button) {
+    return ApolloActionsButtonActionContains(button, @"sort")
+        || [button.accessibilityLabel.lowercaseString containsString:@"sort"];
+}
+
+static NSArray<UIMenuElement *> *ApolloActionsDuoNestTimeRanges(NSArray<UIMenuElement *> *rows, id sortController,
+                                                                 UIView *source) {
+    if (@available(iOS 15.0, *)) {
+        NSMutableArray<UIMenuElement *> *nested = [rows mutableCopy];
+        for (NSUInteger index = 0; index < rows.count; index++) {
+            UIAction *row = [rows[index] isKindOfClass:UIAction.class] ? (UIAction *)rows[index] : nil;
+            NSUInteger kind = ApolloActionMenuNativeKindForElement(rows[index]);
+            if (!row || (kind != 87 && kind != 83)) continue;
+            __weak UIView *weakSource = source;
+            UIDeferredMenuElement *ranges = [UIDeferredMenuElement elementWithProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+                UIView *strongSource = weakSource;
+                if (!strongSource) {
+                    completion(@[ row ]);
+                    return;
+                }
+                // Apollo opens the time range sheet a moment after the row.
+                ApolloNativeActionMenuCaptureLateMenuController(strongSource, ^{
+                    ApolloNativeActionMenuInvokeAction(sortController, (uint16_t)kind);
+                }, ^(id controller) {
+                    UIMenu *menu = controller ? ApolloNativeActionMenuBuildCaptured(controller) : nil;
+                    ApolloLog(@"[NavigationActions] Duo: %@ submenu built %lu row(s)", row.title, (unsigned long)menu.children.count);
+                    completion(menu.children.count ? menu.children : @[ row ]);
+                });
+            }];
+            nested[index] = [UIMenu menuWithTitle:row.title image:row.image identifier:nil options:0 children:@[ ranges ]];
+        }
+        return nested;
+    }
+    return rows;
+}
+
+// Only the overflow representation changes; a visible rail button still
+// sends its original action. Weak owners let popped pages release normally.
+static void ApolloActionsUpdateOverflowRepresentation(UIBarButtonItem *item, UIButton *button, UINavigationItem *navItem) {
+    if (@available(iOS 16.0, *)) {
+        BOOL moderator = ApolloActionsIsModeratorButton(button);
+        BOOL sort = ApolloActionsIsSortButton(button);
+        if (!moderator && !sort) return;
+        NSString *title = moderator ? @"Moderator" : (button.accessibilityLabel ?: @"Sort");
+        item.title = title;
+        item.accessibilityLabel = title;
+        __weak UIButton *weakButton = button;
+        __weak UINavigationItem *weakItem = navItem;
+        UIDeferredMenuElement *rows = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+            UIButton *strongButton = weakButton;
+            UINavigationItem *navigationItem = weakItem;
+            UIViewController *page = [objc_getAssociatedObject(navigationItem, &kActionsControllerKey) controller];
+            if (!strongButton || !page.isViewLoaded || !page.view.window) {
+                completion(@[]);
+                return;
+            }
+            UIView *source = page.view;
+            id sender = navigationItem.overflowPresentationSource ?: source;
+            id controller = ApolloNativeActionMenuCaptureMenuController(source, ^{
+                for (id target in strongButton.allTargets) {
+                    NSString *action = [strongButton actionsForTarget:target forControlEvent:UIControlEventTouchUpInside].firstObject;
+                    if (!action) continue;
+                    [UIApplication.sharedApplication sendAction:NSSelectorFromString(action) to:target from:sender forEvent:nil];
+                    return;
+                }
+                [strongButton sendActionsForControlEvents:UIControlEventTouchUpInside];
+            });
+            UIMenu *menu = controller ? ApolloNativeActionMenuBuildCaptured(controller) : nil;
+            completion(sort ? ApolloActionsDuoNestTimeRanges(menu.children ?: @[], controller, source)
+                            : (menu.children ?: @[]));
+        }];
+        item.menuRepresentation = [UIMenu menuWithTitle:title image:item.image identifier:nil options:0 children:@[rows]];
+    }
+}
+
+// UIKit's overflow item on the vertical rail (iOS 26/27), found by its
+// accessibility identifier. If UIKit renames it, overflow still works but
+// keeps UIKit's default artwork until this identifier is updated.
+static NSString *const kActionsDuoRailOverflowIdentifier = @"BottomOverflowBarButtonItem";
+
+// System overflow owns the space calculation. Its uncached provider builds
+// Apollo's actions when opened, preserving current permissions and menu layout.
+// Neither the provider nor its state may retain the owning page or button.
+@interface ApolloDuoSystemOverflow : NSObject
+@property (nonatomic, weak) UIButton *button;
+@property (nonatomic, strong) UIDeferredMenuElement *provider;
+@property (nonatomic, strong) UIDeferredMenuElement *previous;
+@end
+@implementation ApolloDuoSystemOverflow
+@end
+static char kActionsDuoSystemOverflowKey;
+static UIImage *sApolloDuoMoreGlyph;
+
+static void ApolloActionsRemoveSystemOverflow(UINavigationItem *item) {
+    ApolloDuoSystemOverflow *state = objc_getAssociatedObject(item, &kActionsDuoSystemOverflowKey);
+    if (!state) return;
+    if (@available(iOS 16.0, *)) {
+        if (item.additionalOverflowItems == state.provider) item.additionalOverflowItems = state.previous;
+    }
+    objc_setAssociatedObject(item, &kActionsDuoSystemOverflowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL ApolloActionsInstallSystemOverflow(UINavigationItem *item, UIButton *more) {
+    if (@available(iOS 27.0, *)) {
+        if (!ApolloDeviceIsDuo()) return NO;
+        ApolloDuoSystemOverflow *state = objc_getAssociatedObject(item, &kActionsDuoSystemOverflowKey);
+        if (state && state.button == more && item.additionalOverflowItems == state.provider) return YES;
+        ApolloActionsRemoveSystemOverflow(item);
+        sApolloDuoMoreGlyph = ApolloActionsTemplateImage([UIImage imageNamed:@"option-more"]
+            ?: [more imageForState:UIControlStateNormal] ?: more.currentImage);
+        state = [ApolloDuoSystemOverflow new];
+        state.button = more;
+        state.previous = item.additionalOverflowItems;
+        __weak UINavigationItem *weakItem = item;
+        __weak UIButton *weakMore = more;
+        UIDeferredMenuElement *previous = state.previous;
+        state.provider = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+            UINavigationItem *navItem = weakItem;
+            UIButton *button = weakMore;
+            UIViewController *page = [objc_getAssociatedObject(navItem, &kActionsControllerKey) controller];
+            if (!navItem || !button || !page.isViewLoaded || !page.view.window) {
+                completion(previous ? @[previous] : @[]);
+                return;
+            }
+            if (button.menu && button.showsMenuAsPrimaryAction) {
+                NSMutableArray *elements = [button.menu.children mutableCopy];
+                if (previous) [elements addObject:previous];
+                completion(elements);
+                return;
+            }
+            // Use the visible system button as the sender, not the detached
+            // composite. Apollo's native handlers use the sender for popovers.
+            id anchor = navItem.overflowPresentationSource ?: page.view;
+            // The ••• tap arms the feed context (saved layout, the Moderator
+            // row's follow-up) and disarms it before this menu is built.
+            id captured = ApolloNativeActionMenuCaptureMenuController(page.view, ^{
+                for (id target in button.allTargets) {
+                    NSString *name = [button actionsForTarget:target forControlEvent:UIControlEventTouchUpInside].firstObject;
+                    if (!name) continue;
+                    [UIApplication.sharedApplication sendAction:NSSelectorFromString(name) to:target from:anchor forEvent:nil];
+                    return;
+                }
+                [button sendActionsForControlEvents:UIControlEventTouchUpInside];
+            });
+            UIMenu *menu = captured ? ApolloNativeActionMenuBuildCaptured(captured) : nil;
+            NSMutableArray *elements = [menu.children mutableCopy] ?: [NSMutableArray array];
+            if (previous) [elements addObject:previous];
+            ApolloLog(@"[NavigationActions] System overflow built %lu elements on %@", (unsigned long)elements.count, NSStringFromClass(page.class));
+            completion(elements);
+        }];
+        objc_setAssociatedObject(item, &kActionsDuoSystemOverflowKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        item.additionalOverflowItems = state.provider;
+        ApolloLog(@"[NavigationActions] Installed unified Duo overflow");
+        return YES;
+    }
+    return NO;
+}
+
 static NSArray<UIBarButtonItem *> *ApolloActionsDuoNativeItems(UINavigationItem *item,
                                                                NSArray<UIBarButtonItem *> *items) {
     items = ApolloNativeFeedSearchDuoTrailingItems(item, items);
-    items = ApolloDuoCommentsLayoutItems(item, items);
+    items = ApolloDuoPageLayoutItems(item, items);
     ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
     // Inbox owns its reversible compact/native mapping below.
     if ([NSStringFromClass(box.controller.class) isEqualToString:@"Apollo.InboxViewController"]) return items;
@@ -1137,6 +1350,7 @@ static NSArray<UIBarButtonItem *> *ApolloActionsDuoNativeItems(UINavigationItem 
         && (duoMode == ApolloDuoModeClosed || ApolloActionsHasTrailingTabRail()
             || (duoMode == ApolloDuoModePhone && generated != nil));
     if (!closedDuo) {
+        ApolloActionsRemoveSystemOverflow(item);
         ApolloNavigationActionsOwner *owner = ApolloActionsOwner(item, NO);
         // A collapsed rail publishes only its generated More item, retaining
         // the remaining actions in the owner. It is still our native model:
@@ -1199,20 +1413,47 @@ static NSArray<UIBarButtonItem *> *ApolloActionsDuoNativeItems(UINavigationItem 
             if (leftX > rightX) return NSOrderedDescending;
             return NSOrderedSame;
         }];
-        if (buttons.count < 2) {
+        if (buttons.count < 2 || ![buttons containsObject:more]) {
             [result addObject:barItem];
             continue;
         }
+
+        BOOL systemOverflow = ApolloActionsInstallSystemOverflow(item, more);
 
         // rightBarButtonItems[0] is the trailing item. On a vertical platter
         // UIKit maps that edge to the bottom, so reverse the visual left-to-
         // right order to keep moderator/sort above More.
         for (NSUInteger reverse = buttons.count; reverse > 0; reverse--) {
-            [result addObject:ApolloActionsNativeItemForDuoButton(buttons[reverse - 1], reverse - 1)];
+            UIButton *button = buttons[reverse - 1];
+            if (systemOverflow && button == more) continue;
+            UIBarButtonItem *native = ApolloActionsNativeItemForDuoButton(button, reverse - 1);
+            native.title = button.accessibilityLabel ?: @"Action";
+            // Resolve exported priorities at runtime: device releases still
+            // compile against SDK 26 with the iOS 14 deployment floor.
+            if (systemOverflow && [native respondsToSelector:@selector(setVisibilityPriority:)]) {
+                // Only Sort outranks the rest (the globe stays at the default),
+                // so the rail keeps the same button through a fold when only
+                // one fits.
+                const char *symbol = ApolloActionsIsModeratorButton(button) ? "UIBarButtonItemVisibilityPriorityLow"
+                    : ApolloActionsIsSortButton(button) ? "UIBarButtonItemVisibilityPriorityHigh" : NULL;
+                const NSInteger *priority = symbol ? (const NSInteger *)dlsym(RTLD_DEFAULT, symbol) : NULL;
+                if (priority) ((void (*)(id, SEL, NSInteger))objc_msgSend)(native, @selector(setVisibilityPriority:), *priority);
+            }
+            if (systemOverflow) ApolloActionsUpdateOverflowRepresentation(native, button, item);
+            [result addObject:native];
         }
         converted = YES;
     }
-    if (!converted) return items;
+    if (!converted) {
+        // Search/edit modes replace the strip. Keep our provider only while
+        // an existing mirrored strip is still represented in the live model.
+        BOOL hasMirror = NO;
+        for (UIBarButtonItem *candidate in items) {
+            if (objc_getAssociatedObject(candidate, &kActionsDuoSourceButtonKey)) hasMirror = YES;
+        }
+        if (!hasMirror) ApolloActionsRemoveSystemOverflow(item);
+        return items;
+    }
 
     NSArray *native = [result copy];
     objc_setAssociatedObject(item, &kActionsDuoOriginalItemsKey, [items copy],
@@ -1350,8 +1591,19 @@ static NSArray<UIBarButtonItem *> *ApolloActionsInboxItems(UINavigationItem *ite
     __weak typeof(self) weakSelf = self;
     _resignObserver = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
         object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
-            // Finish our animation without retaining UIKit's transient hidden/alpha state.
-            [weakSelf setExpanded:NO animated:NO];
+            ApolloNavigationActionsOwner *owner = weakSelf;
+            if (owner.animator) {
+                // Never stop a running spring from this deactivation callout:
+                // on iOS 27.2 -stopAnimation: throws inside UIKit here (#1609),
+                // e.g. leaving the app while launch's late-slot spring runs.
+                // Let it land; its completion settles, then collapses.
+                owner.collapseWhenAnimationEnds = YES;
+                ApolloLog(@"[NavigationActions] %@ resigned active mid-spring; collapsing when it lands",
+                          NSStringFromClass(owner.controller.class));
+                return;
+            }
+            // Settle without retaining UIKit's transient hidden/alpha state.
+            [owner setExpanded:NO animated:NO];
         }];
     return self;
 }
@@ -1455,7 +1707,7 @@ static NSArray<UIBarButtonItem *> *ApolloActionsInboxItems(UINavigationItem *ite
                 UIControlState state = stateValue.unsignedIntegerValue;
                 NSMutableDictionary *attributes = [[item titleTextAttributesForState:state] mutableCopy]
                     ?: [NSMutableDictionary dictionary];
-                UIColor *color = ApolloNavigationChromeColor();
+                UIColor *color = ApolloActionsButtonColor();
                 if (state == UIControlStateDisabled) color = [color colorWithAlphaComponent:0.45];
                 if (![attributes[NSForegroundColorAttributeName] isEqual:color]) {
                     attributes[NSForegroundColorAttributeName] = color;
@@ -1709,6 +1961,8 @@ static NSArray<UIBarButtonItem *> *ApolloActionsInboxItems(UINavigationItem *ite
     self.needsGeometryTransition = NO;
     // Supersede deferred settlement so it cannot snap or clean up this new transition.
     self.needsAnimationSettlement = NO;
+    // A newer transition also replaces a collapse the resign observer deferred.
+    self.collapseWhenAnimationEnds = NO;
     // Reversals begin from presentation state, not a guessed endpoint.
     UIViewPropertyAnimator *previous = self.animator;
     BOOL entering = !self.expanded || previous != nil;
@@ -1775,6 +2029,11 @@ static NSArray<UIBarButtonItem *> *ApolloActionsInboxItems(UINavigationItem *ite
             // A menu may acquire the source mid-spring; defer the entire settlement.
             owner.needsAnimationSettlement = YES;
             [owner settleAnimationIfNeeded];
+            if (owner.collapseWhenAnimationEnds) {
+                // The app resigned active mid-spring; apply that collapse now.
+                owner.collapseWhenAnimationEnds = NO;
+                [owner setExpanded:NO animated:NO];
+            }
         }];
         [animator startAnimation];
         for (ApolloNavigationActionsStrip *strip in self.strips) [strip animateIconsExpanded:expanded entering:entering];
@@ -1920,6 +2179,32 @@ static NSArray<UIBarButtonItem *> *ApolloActionsPresentedItems(UINavigationItem 
     return items;
 }
 
+static char kActionsLeadingAccentKey;
+
+// Leading items (the Subreddits list's +) are not otherwise pinned: glass draws
+// an untinted item in the label color. While Accent Navigation Buttons is on
+// they are pinned like the trailing actions; turning it off unpins only the
+// items pinned here. Custom views keep their own styling.
+void ApolloNavigationActionsAccentItem(UIBarButtonItem *item) {
+    if (!item || !IsLiquidGlass() || item.customView) return;
+    BOOL marked = [objc_getAssociatedObject(item, &kActionsLeadingAccentKey) boolValue];
+    if (sAccentNavigationButtons) {
+        if (!marked && objc_getAssociatedObject(item, &kActionsChromeKey)) return;   // pinned elsewhere
+        objc_setAssociatedObject(item, &kActionsLeadingAccentKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloActionsPinChrome(item);
+    } else if (marked) {
+        objc_setAssociatedObject(item, &kActionsLeadingAccentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(item, &kActionsChromeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [sActionsPinned removeObject:item];
+        item.tintColor = nil;
+    }
+}
+
+static void ApolloActionsPrepareLeadingItems(UIViewController *controller) {
+    if (!IsLiquidGlass() || !controller || !ApolloActionsAppController(controller)) return;
+    for (UIBarButtonItem *item in controller.navigationItem.leftBarButtonItems) ApolloNavigationActionsAccentItem(item);
+}
+
 void ApolloNavigationActionsRefresh(UINavigationBar *bar) {
     if (!bar || !IsLiquidGlass() || [objc_getAssociatedObject(bar, &kActionsRefreshKey) boolValue]) return;
     objc_setAssociatedObject(bar, &kActionsRefreshKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1931,7 +2216,39 @@ void ApolloNavigationActionsRefresh(UINavigationBar *bar) {
         UIViewController *top = ApolloActionsNavigation(bar).topViewController;
         if (!top || bar.topItem != top.navigationItem) return;
         ApolloActionsPrepare(top.navigationItem, top.navigationItem.rightBarButtonItems);
+        ApolloActionsPrepareLeadingItems(top);
     });
+}
+
+static void ApolloActionsCollectNavigationBars(UIView *view, NSMutableArray<UINavigationBar *> *bars) {
+    if ([view isKindOfClass:UINavigationBar.class]) {
+        [bars addObject:(UINavigationBar *)view];
+        return;
+    }
+    for (UIView *subview in view.subviews) ApolloActionsCollectNavigationBars(subview, bars);
+}
+
+static void ApolloActionsUpdateBarButtonAccents(void);
+
+// Re-tints every pinned button (the pins compare and only write on change),
+// then lets each visible bar re-prepare its items, leading ones included.
+static void ApolloActionsRefreshButtonColors(void) {
+    for (id object in sActionsPinned.allObjects) {
+        if (objc_getAssociatedObject(object, &kActionsChromeKey)) ApolloActionsPinChrome(object);
+    }
+    NSMutableArray<UINavigationBar *> *bars = [NSMutableArray array];
+    for (UIWindow *window in ApolloAllWindows()) ApolloActionsCollectNavigationBars(window, bars);
+    for (UINavigationBar *bar in bars) ApolloNavigationActionsRefresh(bar);
+    ApolloActionsUpdateBarButtonAccents();
+}
+
+void ApolloNavigationActionsSetAccentButtons(BOOL enabled) {
+    if (sAccentNavigationButtons == enabled) return;
+    sAccentNavigationButtons = enabled;
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:UDKeyAccentNavigationButtons];
+    ApolloActionsRefreshButtonColors();
+    [NSNotificationCenter.defaultCenter postNotificationName:ApolloNavigationButtonColorDidChangeNotification object:nil];
+    ApolloLog(@"[NavigationActions] Accent navigation buttons %@", enabled ? @"on" : @"off");
 }
 
 void ApolloNavigationActionsCollapse(UINavigationItem *item) {
@@ -2033,32 +2350,244 @@ static void ApolloActionsUpdateBackGlass(UIView *button, UIBarButtonItem *item) 
 
 @interface _UIButtonBarButtonVisualProviderIOS : NSObject
 @property (nonatomic, readonly) UIBarButtonItem *barButtonItem;
+@property (nonatomic, readonly) UIView *backIndicatorView;
 @end
 @interface _UIButtonBarButton : UIView
 @property (nonatomic, readonly) _UIButtonBarButtonVisualProviderIOS *visualProvider;
 @end
 
-%group ApolloNavigationActionsBackGlassHooks
+// Accent Navigation Buttons on Liquid Glass. UIKit draws bar glyphs (the
+// Back chevron, the Duo's own glass controls) through the same "monochromatic
+// treatment" as the tab icons, which replaces their tint with black or white.
+// While the setting is on, an accented glyph keeps the treatment off so its
+// tint shows; turning it off hands the glyph back to UIKit with the treatment
+// it had (else 2, as on unselected tab icons).
+static char kActionsAccentGlyphKey;       // an image view accented here
+static char kActionsAccentGlyphTintKey;   // ...whose tint was set here
+static char kActionsAccentGlyphPriorTintKey;   // ...the tint it had before the accent (NSNull when inherited)
+static char kActionsAccentGlyphUIKitKey;  // ...and UIKit's treatment before: @[mode, enabled]
+static char kActionsAccentContentKey;     // a control whose glyphs take the accent
+static char kActionsBackButtonKey;        // a _UIButtonBarButton configured as Back
+static BOOL sActionsAccentGlyphApplying;
+static BOOL sActionsHasAccentedControls;   // set once a control is accented; keeps the image view hooks cheap until then
+
+static BOOL ApolloActionsInAccentedControl(UIView *view) {
+    if (!sActionsHasAccentedControls) return NO;
+    NSInteger depth = 0;
+    for (UIView *ancestor = view.superview; ancestor && depth < 6; ancestor = ancestor.superview, depth++) {
+        if ([objc_getAssociatedObject(ancestor, &kActionsAccentContentKey) boolValue]) return YES;
+    }
+    return NO;
+}
+
+static BOOL ApolloActionsGlyphIsAccented(UIImageView *imageView) {
+    if (!sAccentNavigationButtons) return NO;
+    if ([objc_getAssociatedObject(imageView, &kActionsAccentGlyphKey) boolValue]) return YES;
+    // A glyph UIKit rebuilds inside an accented control (a new button configuration).
+    if (!ApolloActionsInAccentedControl(imageView)) return NO;
+    objc_setAssociatedObject(imageView, &kActionsAccentGlyphKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+// UIKit picks a glyph's treatment while the glyph is already accented (a button
+// built after the setting was on), and the hooks below then override it, so the
+// stock values would never be seen. Keep what UIKit asked for, to hand it back
+// when the setting turns off.
+static void ApolloActionsRecordUIKitTreatment(UIImageView *glyph, NSNumber *mode, NSNumber *enabled) {
+    NSArray *current = objc_getAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey);
+    NSNumber *newMode = mode ?: current[0] ?: @2;
+    NSNumber *newEnabled = enabled ?: current[1] ?: @YES;
+    objc_setAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey, @[ newMode, newEnabled ], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// With setTint, the glyph itself takes the accent (the Back chevron otherwise
+// inherits the bar's tint); a control that already draws in it passes NO.
+static void ApolloActionsSetGlyphAccent(UIImageView *glyph, UIColor *accent, BOOL setTint) {
+    SEL suppressSel = @selector(_setSuppressMonochromaticTreatment:);
+    SEL enableSel = @selector(_setEnableMonochromaticTreatment:);
+    SEL modeSel = @selector(_setMonochromaticTreatment:);
+    if (![glyph respondsToSelector:modeSel]) return;
+    BOOL on = accent != nil;
+    BOOL wasAccented = [objc_getAssociatedObject(glyph, &kActionsAccentGlyphKey) boolValue];
+    SEL modeGet = @selector(_monochromaticTreatment), enableGet = @selector(_enableMonochromaticTreatment);
+    if (on && !wasAccented && [glyph respondsToSelector:modeGet] && [glyph respondsToSelector:enableGet]) {
+        NSArray *uikit = @[ @(((long long (*)(id, SEL))objc_msgSend)(glyph, modeGet)),
+                            @(((BOOL (*)(id, SEL))objc_msgSend)(glyph, enableGet)) ];
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey, uikit, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSArray *uikit = on ? nil : objc_getAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey);
+    int64_t restoredMode = uikit ? [uikit[0] longLongValue] : 2;
+    // Always enabled: while a glyph is accented our own overrides turn the flag off, so
+    // a value read from it afterwards is ours, not UIKit's. Bar glyphs are enabled in stock.
+    BOOL restoredEnabled = YES;
+    if (!on) objc_setAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(glyph, &kActionsAccentGlyphKey, on ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    sActionsAccentGlyphApplying = YES;
+    if (on && setTint) {
+        if (![objc_getAssociatedObject(glyph, &kActionsAccentGlyphTintKey) boolValue]) {
+            // Remember what the chevron drew in before the accent. A chevron that
+            // only inherited its parent's tint goes back to inheriting; one UIKit
+            // or the Duo rail tinted itself (black, not the rail's blue) gets that
+            // color back. Clearing it blindly turned the Duo rail's Back blue.
+            UIColor *prior = glyph.tintColor;
+            BOOL inherited = !prior || [prior isEqual:glyph.superview.tintColor];
+            objc_setAssociatedObject(glyph, &kActionsAccentGlyphPriorTintKey, inherited ? (id)NSNull.null : prior,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (glyph.tintColor != accent) glyph.tintColor = accent;
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphTintKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if (!on && [objc_getAssociatedObject(glyph, &kActionsAccentGlyphTintKey) boolValue]) {
+        id prior = objc_getAssociatedObject(glyph, &kActionsAccentGlyphPriorTintKey);
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphTintKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphPriorTintKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        glyph.tintColor = [prior isKindOfClass:UIColor.class] ? prior : nil;
+    }
+    if ([glyph respondsToSelector:suppressSel]) ((void (*)(id, SEL, BOOL))objc_msgSend)(glyph, suppressSel, on);
+    ((void (*)(id, SEL, int64_t))objc_msgSend)(glyph, modeSel, on ? 0 : restoredMode);
+    if ([glyph respondsToSelector:enableSel]) ((void (*)(id, SEL, BOOL))objc_msgSend)(glyph, enableSel, on ? NO : restoredEnabled);
+    sActionsAccentGlyphApplying = NO;
+}
+
+static void ApolloActionsCollectGlyphs(UIView *view, NSMutableArray<UIImageView *> *glyphs) {
+    if ([view isKindOfClass:UIImageView.class]) [glyphs addObject:(UIImageView *)view];
+    for (UIView *subview in view.subviews) ApolloActionsCollectGlyphs(subview, glyphs);
+}
+
+void ApolloNavigationActionsAccentControl(UIView *control) {
+    if (!control || !IsLiquidGlass()) return;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    if (!accent && ![objc_getAssociatedObject(control, &kActionsAccentContentKey) boolValue]) return;
+    if (accent) sActionsHasAccentedControls = YES;
+    objc_setAssociatedObject(control, &kActionsAccentContentKey, accent ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSMutableArray<UIImageView *> *glyphs = [NSMutableArray array];
+    ApolloActionsCollectGlyphs(control, glyphs);
+    for (UIImageView *glyph in glyphs) {
+        if (accent || [objc_getAssociatedObject(glyph, &kActionsAccentGlyphKey) boolValue])
+            ApolloActionsSetGlyphAccent(glyph, accent, NO);
+    }
+}
+
+static void ApolloActionsUpdateBackAccent(UIView *button) {
+    if (![objc_getAssociatedObject(button, &kActionsBackButtonKey) boolValue]) return;
+    _UIButtonBarButtonVisualProviderIOS *provider = ((_UIButtonBarButton *)button).visualProvider;
+    if (![provider respondsToSelector:@selector(backIndicatorView)]) return;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    for (UIView *subview in provider.backIndicatorView.subviews) {
+        if (![subview isKindOfClass:UIImageView.class]) continue;
+        BOOL accented = [objc_getAssociatedObject(subview, &kActionsAccentGlyphKey) boolValue];
+        if (accent || accented) ApolloActionsSetGlyphAccent((UIImageView *)subview, accent, YES);
+    }
+}
+
+static BOOL ApolloActionsIsSystemMoreItem(UIBarButtonItem *item);
+
+// A split view's own sidebar toggle (Settings and Inbox on the Duo), which
+// UIKit targets at its private split implementation.
+static BOOL ApolloActionsIsSidebarToggle(UIBarButtonItem *item) {
+    static SEL toggle;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ toggle = sel_registerName("_handlePrimaryEdgeBarButtonItem:"); });
+    return item.action == toggle || [item.target isKindOfClass:UISplitViewController.class];
+}
+
+// UIKit's own items, which NavigationActions never pins: the Duo overflow •••
+// and the sidebar toggle. A changed tint reconfigures the button.
+static void ApolloActionsAccentSystemItem(UIBarButtonItem *item) {
+    if (!item || (!ApolloActionsIsSystemMoreItem(item) && !ApolloActionsIsSidebarToggle(item))) return;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    if (item.tintColor != accent) item.tintColor = accent;
+}
+
+static void ApolloActionsCollectBarButtons(UIView *view, NSMutableArray<UIView *> *buttons) {
+    if ([view isKindOfClass:ApolloClassUIButtonBarButton]) {
+        [buttons addObject:view];
+        return;
+    }
+    for (UIView *subview in view.subviews) ApolloActionsCollectBarButtons(subview, buttons);
+}
+
+// Whole windows: the Duo rails host bar buttons outside UINavigationBar.
+static void ApolloActionsUpdateBarButtonAccents(void) {
+    if (!IsLiquidGlass() || !ApolloClassUIButtonBarButton) return;
+    NSMutableArray<UIView *> *buttons = [NSMutableArray array];
+    for (UIWindow *window in ApolloAllWindows()) ApolloActionsCollectBarButtons(window, buttons);
+    for (UIView *button in buttons) {
+        ApolloActionsUpdateBackAccent(button);
+        ApolloActionsAccentSystemItem(((_UIButtonBarButton *)button).visualProvider.barButtonItem);
+    }
+}
+
+// Accent Navigation Buttons, Back (every Liquid Glass version).
+%group ApolloNavigationActionsBackAccentHooks
 %hook _UIButtonBarButton
 - (void)_configureFromBarItem:(UIBarButtonItem *)item appearanceDelegate:(id)delegate isBackButton:(BOOL)back useBreadcrumbStyle:(BOOL)breadcrumb {
-    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
-    BOOL isolate = back && IsLiquidGlass() && sCollapseNavigationActions &&
-        ApolloActionsHasTrailingTabRail() && !tabs.presentedViewController;
-    BOOL managed = [objc_getAssociatedObject(item, &kActionsDuoBackItemKey) boolValue];
-    // Mark UIKit's generated Back item, rather than supplying a replacement
-    // navigation item (which would lose its native title/history behavior).
-    if (@available(iOS 26.0, *)) {
-        if (isolate && (managed || !item.hidesSharedBackground)) {
-            objc_setAssociatedObject(item, &kActionsDuoBackItemKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            if (!item.hidesSharedBackground) item.hidesSharedBackground = YES;
-        } else if (managed) {
-            objc_setAssociatedObject(item, &kActionsDuoBackItemKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            item.hidesSharedBackground = NO;
-        }
-    }
+    if (!back) ApolloActionsAccentSystemItem(item);
     %orig(item, delegate, back, breadcrumb);
-    ApolloActionsUpdateBackGlass((UIView *)self, item);
+    objc_setAssociatedObject(self, &kActionsBackButtonKey, back ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloActionsUpdateBackAccent((UIView *)self);
 }
+- (void)willMoveToWindow:(UIWindow *)window {
+    %orig(window);
+    // The chevron is installed after the initial configuration.
+    if (window) ApolloActionsUpdateBackAccent((UIView *)self);
+}
+%end
+
+%end
+
+// UIKit re-derives a glyph's treatment (trait and tint changes, Control
+// Center, a rebuilt button); keep it off while the glyph carries the accent.
+%group ApolloNavigationActionsAccentGlyphHooks
+%hook UIImageView
+- (void)_applyMonochromaticInputsWithPreferredTreatment:(int64_t)treatment suppressTreatment:(BOOL)suppress {
+    if (!sActionsAccentGlyphApplying && ApolloActionsGlyphIsAccented(self)) {
+        if (treatment != 0) ApolloActionsRecordUIKitTreatment(self, @(treatment), nil);
+        suppress = YES;
+    }
+    %orig(treatment, suppress);
+}
+- (void)_setEnableMonochromaticTreatment:(BOOL)enable {
+    if (enable && !sActionsAccentGlyphApplying && ApolloActionsGlyphIsAccented(self)) {
+        ApolloActionsRecordUIKitTreatment(self, nil, @YES);
+        %orig(NO);
+        return;
+    }
+    %orig(enable);
+}
+- (void)_setMonochromaticTreatment:(int64_t)treatment {
+    if (treatment != 0 && !sActionsAccentGlyphApplying && ApolloActionsGlyphIsAccented(self)) {
+        ApolloActionsRecordUIKitTreatment(self, @(treatment), nil);
+        %orig(0);
+        return;
+    }
+    %orig(treatment);
+}
+// UIKit rebuilds the Back chevron on rotation and resets its tint, which
+// left the Duo rail's chevron in the inherited system blue. Keep the accent.
+- (void)setTintColor:(UIColor *)color {
+    if (!sActionsAccentGlyphApplying && sAccentNavigationButtons &&
+        [objc_getAssociatedObject(self, &kActionsAccentGlyphTintKey) boolValue]) {
+        // What UIKit wanted is the tint to give back when the setting turns off.
+        objc_setAssociatedObject(self, &kActionsAccentGlyphPriorTintKey, color ?: (id)NSNull.null,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        color = ApolloNavigationButtonAccentColor() ?: color;
+    }
+    %orig(color);
+}
+// A glyph added to an accented control after its treatment was chosen.
+- (void)didMoveToWindow {
+    %orig;
+    if (sAccentNavigationButtons && self.window && !sActionsAccentGlyphApplying &&
+        ![objc_getAssociatedObject(self, &kActionsAccentGlyphKey) boolValue] &&
+        ApolloActionsInAccentedControl(self)) {
+        ApolloActionsSetGlyphAccent(self, ApolloNavigationButtonAccentColor(), NO);
+    }
+}
+%end
+%end
+
+%group ApolloNavigationActionsBackGlassHooks
+%hook _UIButtonBarButton
 - (void)willMoveToWindow:(UIWindow *)window {
     %orig(window);
     // UIKit finishes installing its chevron/mask after initial configuration.
@@ -2344,7 +2873,21 @@ static void ApolloActionsUpdateBackGlass(UIView *button, UIBarButtonItem *item) 
     NSHashTable<UIBarButtonItem *> *mirrors = objc_getAssociatedObject(self, &kActionsDuoMirroredItemsKey);
     if (mirrors.count) {
         UIImage *current = ApolloActionsTemplateImage([self imageForState:UIControlStateNormal] ?: self.currentImage);
-        for (UIBarButtonItem *item in mirrors) item.image = current;
+        for (UIBarButtonItem *item in mirrors) {
+            // Translation and Apollo both refresh their source buttons after
+            // navigation settles. Do not replay an image transition for an
+            // unchanged glyph, or invalidate its overflow representation.
+            // Compare the source, not the displayed image: Moderator's image
+            // has alignment insets applied later by prepareItems:.
+            if (objc_getAssociatedObject(item, &kActionsDuoMirroredImageKey) == current) continue;
+            objc_setAssociatedObject(item, &kActionsDuoMirroredImageKey, current, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            item.image = current;
+            if (@available(iOS 16.0, *)) {
+                UIMenu *menu = [item.menuRepresentation isKindOfClass:UIMenu.class] ? (UIMenu *)item.menuRepresentation : nil;
+                if (menu) item.menuRepresentation = [UIMenu menuWithTitle:item.title ?: menu.title image:current
+                    identifier:menu.identifier options:menu.options children:menu.children];
+            }
+        }
     }
 }
 %end
@@ -2359,7 +2902,53 @@ static void ApolloActionsUpdateBackGlass(UIView *button, UIBarButtonItem *item) 
 }
 - (void)setImage:(UIImage *)image {
     if (objc_getAssociatedObject(self, &kActionsChromeKey) || ApolloActionsIsAutoModClose(self)) image = ApolloActionsTemplateImage(image);
+    if ((objc_getAssociatedObject(self, &kActionsChromeKey) ||
+         objc_getAssociatedObject(self, &kActionsDuoBackItemKey)) && self.image == image) return;
     %orig(image);
+}
+%end
+%end
+
+// UIKit uses distinct generated items for the top/inner-landscape and
+// bottom/cover overflow placements. Both belong to Apollo's action pill.
+static BOOL ApolloActionsIsSystemMoreItem(UIBarButtonItem *item) {
+    NSString *identifier = item.accessibilityIdentifier;
+    return sApolloDuoMoreGlyph &&
+        ([identifier isEqualToString:kActionsDuoRailOverflowIdentifier]
+         || [identifier isEqualToString:@"TopOverflowBarButtonItem"]);
+}
+
+%group ApolloNavigationActionsRailItemHooks
+%hook _UIButtonBarButton
+- (void)_configureFromBarItem:(UIBarButtonItem *)item appearanceDelegate:(id)delegate isBackButton:(BOOL)back useBreadcrumbStyle:(BOOL)breadcrumb {
+    // Keep Apollo's actual horizontal ellipsis artwork on UIKit's unified
+    // overflow button. Only touch the Duo trailing overflow item.
+    if (ApolloActionsIsSystemMoreItem(item)) {
+        if (item.image != sApolloDuoMoreGlyph) item.image = sApolloDuoMoreGlyph;
+        if (item.primaryAction.image != sApolloDuoMoreGlyph) item.primaryAction.image = sApolloDuoMoreGlyph;
+        // Any write reconfigures the button and re-enters this hook, so an
+        // unconditional one loops forever (a launch hang on the inner display).
+        if (![item.accessibilityLabel isEqualToString:@"More"]) item.accessibilityLabel = @"More";
+    }
+    BOOL decorate = NO;
+    if (@available(iOS 27.1, *)) decorate = IsLiquidGlass();
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    BOOL isolate = decorate && back && IsLiquidGlass() && sCollapseNavigationActions &&
+        ApolloActionsHasTrailingTabRail() && !tabs.presentedViewController;
+    BOOL managed = [objc_getAssociatedObject(item, &kActionsDuoBackItemKey) boolValue];
+    // Mark UIKit's generated Back item, rather than supplying a replacement
+    // navigation item (which would lose its native title/history behavior).
+    if (@available(iOS 26.0, *)) {
+        if (isolate && (managed || !item.hidesSharedBackground)) {
+            objc_setAssociatedObject(item, &kActionsDuoBackItemKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (!item.hidesSharedBackground) item.hidesSharedBackground = YES;
+        } else if (managed) {
+            objc_setAssociatedObject(item, &kActionsDuoBackItemKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            item.hidesSharedBackground = NO;
+        }
+    }
+    %orig(item, delegate, back, breadcrumb);
+    if (decorate) ApolloActionsUpdateBackGlass((UIView *)self, item);
 }
 %end
 %end
@@ -2372,6 +2961,37 @@ static void ApolloActionsUpdateBackGlass(UIView *button, UIBarButtonItem *item) 
         }
         if (IsLiquidGlass()) {
             %init(ApolloNavigationActionsChromeHooks);
+            // Accent Navigation Buttons needs UIKit's glyph treatment setters.
+            if (class_getInstanceMethod(UIImageView.class, @selector(_setMonochromaticTreatment:))) {
+                %init(ApolloNavigationActionsAccentGlyphHooks);
+                SEL configure = @selector(_configureFromBarItem:appearanceDelegate:isBackButton:useBreadcrumbStyle:);
+                if (ApolloClassUIButtonBarButton && class_getInstanceMethod(ApolloClassUIButtonBarButton, configure))
+                    %init(ApolloNavigationActionsBackAccentHooks);
+                else ApolloLog(@"[NavigationActions] Back accent unavailable: no Back configuration hook");
+            } else {
+                ApolloLog(@"[NavigationActions] Accent glyphs unavailable: no treatment setters");
+            }
+            [NSNotificationCenter.defaultCenter addObserverForName:@"com.christianselig.ApolloSpecificThemeChanged"
+                                                            object:nil
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(__unused NSNotification *note) {
+                // Apollo finishes applying the theme after posting.
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    sActionsButtonAccent = nil;
+                    if (!sAccentNavigationButtons) return;
+                    ApolloActionsRefreshButtonColors();
+                    [NSNotificationCenter.defaultCenter postNotificationName:ApolloNavigationButtonColorDidChangeNotification object:nil];
+                });
+            }];
+        }
+        if (ApolloDeviceIsDuo()) {
+            if (ApolloClassUIButtonBarButton
+                && class_getInstanceMethod(ApolloClassUIButtonBarButton,
+                                           @selector(_configureFromBarItem:appearanceDelegate:isBackButton:useBreadcrumbStyle:))) {
+                %init(ApolloNavigationActionsRailItemHooks);
+            }
+        } else {
+            ApolloLog(@"[NavigationActions] not an iPhone Duo; rail item tracking and system overflow NOT installed");
         }
         ApolloLog(@"[NavigationActions] Page-owned native strip hooks installed");
     }

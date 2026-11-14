@@ -26,8 +26,15 @@ BOOL ApolloDuoAllowsTabBarScrollHiding(void);
 /// reserved-region APIs, keeping hinge readings for live effects only.
 CGRect ApolloDuoActiveVerticalDivision(UIView *view);
 
+/// Active tabletop division in this view's coordinates; CGRectNull when flat.
+CGRect ApolloDuoActiveHorizontalDivision(UIView *view);
+
 /// Refresh the cached window mode without changing UIKit's tab bar.
 void ApolloDuoRailSync(void);
+
+/// Moves Apollo's tab bar pan back beside the Liquid Lens after the Duo moves
+/// its bars. Defined in ApolloLiquidGlass.xm.
+void ApolloTabBarSwipeScheduleLensCheck(UITabBarController *tabBarController);
 
 /// Mark Apollo's Texture feed tables before a navigation push measures them.
 void ApolloDuoRailPrepareFeedContent(UIViewController *controller);
@@ -52,6 +59,11 @@ BOOL ApolloDuoCoverChromeIsActive(void);
 /// Cover content geometry, including when UIKit reports a regular width or
 /// exposes only the active UIScreen. Uses Duo capability and live fold size.
 BOOL ApolloDuoUsesCoverContentInsets(void);
+
+/// YES for views in the account sheet while it sits below the trailing rail
+/// (not the large detent). The sheet clears the rail from their safe area, so
+/// title centering must not reserve it either. Defined in the account switcher.
+BOOL ApolloIsAccountSheetContent(UIView *view);
 
 /// Keep the comments jump button clear of Duo's system chrome and tab rail.
 void ApolloDuoCoverAdjustJumpButton(UIViewController *comments);
